@@ -304,6 +304,228 @@ done
 done
 [[ "$changed" == "true" ]] && command -v iptables &> /dev/null && persist_iptables_rules
 }
+parse_port_entry() {
+local entry="$1" listen dest
+if [[ "$entry" == *=* ]]; then
+listen="${entry%%=*}"; dest="${entry#*=}"
+elif [[ "$entry" == *:* ]]; then
+listen="${entry%%:*}"; dest="${entry#*:}"
+else
+listen="$entry"; dest="$entry"
+fi
+listen="${listen//-/:}"
+dest="${dest//-/:}"
+echo "$listen $dest"
+}
+ensure_tun_masquerade() {
+local tun_name="$1"
+command -v iptables &> /dev/null || return
+if ! iptables -t nat -C POSTROUTING -o "$tun_name" -j MASQUERADE 2>/dev/null; then
+iptables -t nat -A POSTROUTING -o "$tun_name" -j MASQUERADE
+persist_iptables_rules
+fi
+}
+apply_iptables_dnat_forwarding() {
+local mapping="$1" target="$2" entry listen dest proto
+if ! command -v iptables &> /dev/null; then
+colorize red "iptables is not available; cannot set up iptables forwarding."
+return 1
+fi
+local -a entries=()
+IFS=',' read -r -a entries <<< "$mapping"
+local changed="false"
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+[[ -z "$entry" ]] && continue
+read -r listen dest <<< "$(parse_port_entry "$entry")"
+for proto in tcp udp; do
+if ! iptables -t nat -C PREROUTING -p "$proto" --dport "$listen" -j DNAT --to-destination "${target}:${dest}" 2>/dev/null; then
+iptables -t nat -A PREROUTING -p "$proto" --dport "$listen" -j DNAT --to-destination "${target}:${dest}"
+changed="true"
+fi
+if ! iptables -C FORWARD -p "$proto" -d "$target" --dport "$dest" -j ACCEPT 2>/dev/null; then
+iptables -I FORWARD -p "$proto" -d "$target" --dport "$dest" -j ACCEPT
+changed="true"
+fi
+done
+done
+[[ "$changed" == "true" ]] && persist_iptables_rules
+}
+remove_iptables_dnat_forwarding() {
+local mapping="$1" target="$2" entry listen dest proto
+command -v iptables &> /dev/null || return 0
+local -a entries=()
+IFS=',' read -r -a entries <<< "$mapping"
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+[[ -z "$entry" ]] && continue
+read -r listen dest <<< "$(parse_port_entry "$entry")"
+for proto in tcp udp; do
+iptables -t nat -D PREROUTING -p "$proto" --dport "$listen" -j DNAT --to-destination "${target}:${dest}" 2>/dev/null
+iptables -D FORWARD -p "$proto" -d "$target" --dport "$dest" -j ACCEPT 2>/dev/null
+done
+done
+persist_iptables_rules
+}
+ensure_haproxy_installed() {
+if ! command -v haproxy &> /dev/null; then
+if command -v apt-get &> /dev/null; then
+colorize yellow "Installing haproxy..."
+apt-get update -qq >/dev/null 2>&1
+apt-get install -y haproxy >/dev/null 2>&1
+fi
+fi
+command -v haproxy &> /dev/null
+}
+apply_haproxy_forwarding() {
+local mapping="$1" target="$2" config_name="$3"
+ensure_haproxy_installed || { colorize red "haproxy is not available; cannot set up haproxy forwarding."; return 1; }
+local cfg="/etc/haproxy/haproxy.cfg"
+if [[ ! -f "$cfg" ]]; then
+mkdir -p "$(dirname "$cfg")"
+cat > "$cfg" <<'EOF'
+global
+    maxconn 20000
+defaults
+    mode tcp
+    timeout connect 5s
+    timeout client 1m
+    timeout server 1m
+EOF
+fi
+local marker_start="# BEGIN backhaul:${config_name}"
+local marker_end="# END backhaul:${config_name}"
+awk -v s="$marker_start" -v e="$marker_end" '
+$0==s {skip=1}
+!skip {print}
+$0==e {skip=0}
+' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+local entry listen dest idx=0
+local -a entries=()
+IFS=',' read -r -a entries <<< "$mapping"
+{
+echo "$marker_start"
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+[[ -z "$entry" ]] && continue
+read -r listen dest <<< "$(parse_port_entry "$entry")"
+if [[ "$listen" == *:* ]]; then
+colorize yellow "HAProxy forwarder does not support port ranges (${listen}); skipping this entry."
+continue
+fi
+((idx++))
+echo "frontend backhaul_${config_name}_${idx}"
+echo "    bind *:${listen}"
+echo "    default_backend backhaul_${config_name}_${idx}_be"
+echo "backend backhaul_${config_name}_${idx}_be"
+echo "    server srv1 ${target}:${dest} check"
+done
+echo "$marker_end"
+} >> "$cfg"
+if haproxy -c -f "$cfg" &> /dev/null; then
+systemctl enable --now haproxy >/dev/null 2>&1
+systemctl reload haproxy 2>/dev/null || systemctl restart haproxy 2>/dev/null
+colorize green "✔ HAProxy forwarding configured."
+else
+colorize red "✘ Generated HAProxy config is invalid; not applying. Check with: haproxy -c -f ${cfg}"
+return 1
+fi
+}
+remove_haproxy_block() {
+local config_name="$1"
+local cfg="/etc/haproxy/haproxy.cfg"
+[[ -f "$cfg" ]] || return
+local marker_start="# BEGIN backhaul:${config_name}"
+local marker_end="# END backhaul:${config_name}"
+awk -v s="$marker_start" -v e="$marker_end" '
+$0==s {skip=1; next}
+$0==e {skip=0; next}
+!skip {print}
+' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+if command -v haproxy &> /dev/null && haproxy -c -f "$cfg" &> /dev/null; then
+systemctl reload haproxy 2>/dev/null
+fi
+}
+ensure_ipvsadm_installed() {
+if ! command -v ipvsadm &> /dev/null; then
+if command -v apt-get &> /dev/null; then
+colorize yellow "Installing ipvsadm..."
+apt-get update -qq >/dev/null 2>&1
+apt-get install -y ipvsadm >/dev/null 2>&1
+fi
+fi
+command -v ipvsadm &> /dev/null
+}
+apply_ipvs_forwarding() {
+local mapping="$1" target="$2" entry listen dest
+ensure_ipvsadm_installed || { colorize red "ipvsadm is not available; cannot set up IPVS forwarding."; return 1; }
+modprobe ip_vs 2>/dev/null
+local -a entries=()
+IFS=',' read -r -a entries <<< "$mapping"
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+[[ -z "$entry" ]] && continue
+read -r listen dest <<< "$(parse_port_entry "$entry")"
+if [[ "$listen" == *:* ]]; then
+colorize yellow "IPVS forwarder does not support port ranges (${listen}); skipping this entry."
+continue
+fi
+ipvsadm -D -t "0.0.0.0:${listen}" 2>/dev/null
+ipvsadm -A -t "0.0.0.0:${listen}" -s wrr
+ipvsadm -a -t "0.0.0.0:${listen}" -r "${target}:${dest}" -m
+done
+if command -v ipvsadm-save &> /dev/null; then
+ipvsadm-save -n > /etc/ipvsadm.rules 2>/dev/null
+systemctl enable ipvsadm >/dev/null 2>&1
+fi
+colorize green "✔ IPVS forwarding configured."
+}
+remove_ipvs_forwarding() {
+local mapping="$1" entry listen dest
+command -v ipvsadm &> /dev/null || return
+local -a entries=()
+IFS=',' read -r -a entries <<< "$mapping"
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+[[ -z "$entry" ]] && continue
+read -r listen dest <<< "$(parse_port_entry "$entry")"
+[[ "$listen" == *:* ]] && continue
+ipvsadm -D -t "0.0.0.0:${listen}" 2>/dev/null
+done
+if command -v ipvsadm-save &> /dev/null; then
+ipvsadm-save -n > /etc/ipvsadm.rules 2>/dev/null
+fi
+}
+apply_tun_port_forwarding() {
+local mapping="$1" forwarder="$2" tun_remote_addr="$3" tun_name="$4" config_name="$5"
+[[ -z "$mapping" ]] && return
+local target="${tun_remote_addr%/*}"
+case "$forwarder" in
+iptables)
+ensure_tun_masquerade "$tun_name"
+apply_iptables_dnat_forwarding "$mapping" "$target"
+;;
+haproxy)
+apply_haproxy_forwarding "$mapping" "$target" "$config_name"
+;;
+ipvs)
+ensure_tun_masquerade "$tun_name"
+apply_ipvs_forwarding "$mapping" "$target"
+;;
+*)
+allow_forwarded_ports_firewall "$mapping" "true"
+;;
+esac
+}
+remove_tun_port_forwarding() {
+local mapping="$1" forwarder="$2" tun_remote_addr="$3" config_name="$4"
+local target="${tun_remote_addr%/*}"
+case "$forwarder" in
+iptables) remove_iptables_dnat_forwarding "$mapping" "$target" ;;
+haproxy) remove_haproxy_block "$config_name" ;;
+ipvs) remove_ipvs_forwarding "$mapping" ;;
+esac
+}
 ensure_watchdog_installed() {
 local unit_service="${service_dir}/backhaul-watchdog.service"
 local unit_timer="${service_dir}/backhaul-watchdog.timer"
@@ -996,8 +1218,18 @@ read -r CONFIG[ports_mapping]
 echo ""
 else
 colorize blue "━━━ Port Mapping Configuration (tun helper) ━━━" bold
-colorize magenta "Forwarder: use 'bbackhaul' for TCP support only, or 'iptables' for TCP + UDP support"
-prompt_with_default "Forwarder (backhaul/iptables)" "backhaul" CONFIG[forwarder]
+colorize magenta "Forwarder engines:"
+echo "  backhaul  - internal TCP-only proxy, no extra setup"
+echo "  iptables  - kernel DNAT, TCP + UDP, lowest overhead"
+echo "  haproxy   - userspace TCP proxy with backend health-check"
+echo "  ipvs      - kernel-level load balancer (ipvsadm), TCP + UDP"
+local -a valid_forwarders=(backhaul iptables haproxy ipvs)
+while true; do
+prompt_with_default "Forwarder" "backhaul" CONFIG[forwarder]
+CONFIG[forwarder]="${CONFIG[forwarder],,}"
+[[ " ${valid_forwarders[*]} " == *" ${CONFIG[forwarder]} "* ]] && break
+colorize red "Invalid forwarder. Choose one of: ${valid_forwarders[*]}"
+done
 echo ""
 colorize green "Supported formats:"
 echo "  1. 443           - Listen on 443, forward to 443"
@@ -1213,12 +1445,16 @@ fi
 if [[ "$is_ipx" == "true" ]]; then
 allow_ipx_protocol_firewall "${CONFIG[ipx_profile]}"
 fi
-if [[ "$mode" == "server" ]]; then
-allow_forwarded_ports_firewall "${CONFIG[ports_mapping]}" "${CONFIG[accept_udp]}"
-fi
-create_systemd_service "$service_type" "$tunnel_port" "$config_file"
 local config_name
 config_name=$(basename "${config_file%.toml}")
+if [[ "$mode" == "server" ]]; then
+if [[ "$is_tun" == "true" ]]; then
+apply_tun_port_forwarding "${CONFIG[ports_mapping]}" "${CONFIG[forwarder]}" "${CONFIG[tun_remote_addr]}" "${CONFIG[tun_name]}" "$config_name"
+else
+allow_forwarded_ports_firewall "${CONFIG[ports_mapping]}" "${CONFIG[accept_udp]}"
+fi
+fi
+create_systemd_service "$service_type" "$tunnel_port" "$config_file"
 local peer_ip_for_meta="${CONFIG[peer_ip]}"
 [[ -z "$peer_ip_for_meta" && "$is_ipx" == "true" ]] && peer_ip_for_meta="${CONFIG[ipx_dst_ip]}"
 write_tunnel_meta "$config_name" "$peer_ip_for_meta" "${CONFIG[peer_ssh_port]}"
@@ -1540,6 +1776,17 @@ local config_path="$1" service_name="$2" new_mapping="$3" service_path config_na
 service_path="${service_dir}/${service_name}"
 config_name=$(basename "${config_path%.toml}")
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "$config_name")
+
+local is_tun="false" forwarder old_mapping tun_remote_addr tun_name
+tunnel_is_tun "$config_path" && is_tun="true"
+forwarder=$(toml_get "$config_path" "ports" "forwarder")
+old_mapping=$(load_toml_ports_mapping "$config_path")
+tun_remote_addr=$(toml_get "$config_path" "tun" "remote_addr")
+tun_name=$(toml_tun_name "$config_path")
+if [[ "$is_tun" == "true" && -n "$forwarder" && "$forwarder" != "backhaul" ]]; then
+remove_tun_port_forwarding "$old_mapping" "$forwarder" "$tun_remote_addr" "$config_name"
+fi
+
 awk -v newmap="$new_mapping" '
 BEGIN { n = split(newmap, arr, ",") }
 /^mapping = \[/ {
@@ -1551,7 +1798,12 @@ inarr && /^\]/ { print; inarr=0; next }
 inarr { next }
 { print }
 ' "$config_path" > "${config_path}.new" && mv "${config_path}.new" "$config_path"
+
+if [[ "$is_tun" == "true" ]]; then
+apply_tun_port_forwarding "$new_mapping" "$forwarder" "$tun_remote_addr" "$tun_name" "$config_name"
+else
 allow_forwarded_ports_firewall "$new_mapping" "$(toml_get "$config_path" "transport" "accept_udp")"
+fi
 systemctl restart "$service_name"
 sleep 2
 if systemctl is-active --quiet "$service_name"; then
@@ -1643,6 +1895,7 @@ backup_dir=$(backup_tunnel "$config_path" "$service_path" "$config_name")
 colorize green "Current config backed up: $backup_dir"
 mv "$config_path" "${config_path}.editing"
 load_toml_into_config "${backup_dir}/config.toml"
+local old_forwarder="${CONFIG[forwarder]}" old_mapping="${CONFIG[ports_mapping]}" old_tun_remote_addr="${CONFIG[tun_remote_addr]}"
 clear
 colorize cyan "Edit Tunnel: ${config_name}" bold
 echo ""
@@ -1688,8 +1941,15 @@ fi
 if [[ "$is_ipx" == "true" ]]; then
 allow_ipx_protocol_firewall "${CONFIG[ipx_profile]}"
 fi
+if [[ -n "$old_forwarder" && "$old_forwarder" != "backhaul" ]]; then
+remove_tun_port_forwarding "$old_mapping" "$old_forwarder" "$old_tun_remote_addr" "$config_name"
+fi
 if [[ "$mode" == "server" ]]; then
+if [[ "$is_tun" == "true" ]]; then
+apply_tun_port_forwarding "${CONFIG[ports_mapping]}" "${CONFIG[forwarder]}" "${CONFIG[tun_remote_addr]}" "${CONFIG[tun_name]}" "$new_config_name"
+else
 allow_forwarded_ports_firewall "${CONFIG[ports_mapping]}" "${CONFIG[accept_udp]}"
+fi
 fi
 local peer_ip_for_meta="${CONFIG[peer_ip]}"
 [[ -z "$peer_ip_for_meta" && "$is_ipx" == "true" ]] && peer_ip_for_meta="${CONFIG[ipx_dst_ip]}"
@@ -1949,9 +2209,15 @@ config_path="$1"
 config_name=$(basename "${config_path%.toml}")
 service_name="backhaul-${config_name}.service"
 service_path="$service_dir/$service_name"
-local removed_tun_name removed_profile
+local removed_tun_name removed_profile removed_forwarder removed_mapping removed_tun_remote_addr
 removed_tun_name=$(toml_tun_name "$config_path")
 removed_profile=$(toml_ipx_profile "$config_path")
+removed_forwarder=$(toml_get "$config_path" "ports" "forwarder")
+removed_mapping=$(load_toml_ports_mapping "$config_path")
+removed_tun_remote_addr=$(toml_get "$config_path" "tun" "remote_addr")
+if [[ -n "$removed_forwarder" && "$removed_forwarder" != "backhaul" ]]; then
+remove_tun_port_forwarding "$removed_mapping" "$removed_forwarder" "$removed_tun_remote_addr" "$config_name"
+fi
 [ -f "$config_path" ] && rm -f "$config_path"
 if [[ -f "$service_path" ]]; then
 systemctl is-active --quiet "$service_name" && systemctl disable --now "$service_name" >/dev/null 2>&1
