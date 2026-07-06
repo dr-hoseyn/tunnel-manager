@@ -65,6 +65,7 @@ return 1
 fi
 IFS='/' read -r ip mask <<< "$cidr"
 IFS='.' read -r a b c d <<< "$ip"
+a=$((10#$a)); b=$((10#$b)); c=$((10#$c)); d=$((10#$d)); mask=$((10#$mask))
 if (( a<0 || a>255 || b<0 || b>255 || c<0 || c>255 || d<0 || d>255 )); then
 return 1
 fi
@@ -87,6 +88,237 @@ if (( ip_int == broadcast_int )); then
 return 1
 fi
 return 0
+}
+cidr_range() {
+local cidr="$1"
+local ip="${cidr%/*}"
+local mask="${cidr#*/}"
+local a b c d
+IFS='.' read -r a b c d <<< "$ip"
+a=$((10#$a)); b=$((10#$b)); c=$((10#$c)); d=$((10#$d)); mask=$((10#$mask))
+local ip_int=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+local mask_int
+if (( mask == 0 )); then
+mask_int=0
+else
+mask_int=$(( (0xFFFFFFFF << (32 - mask)) & 0xFFFFFFFF ))
+fi
+local net_int=$(( ip_int & mask_int ))
+local broadcast_int=$(( net_int | (~mask_int & 0xFFFFFFFF) ))
+echo "$net_int $broadcast_int"
+}
+cidr_overlaps() {
+local net1 bcast1 net2 bcast2
+read -r net1 bcast1 <<< "$(cidr_range "$1")"
+read -r net2 bcast2 <<< "$(cidr_range "$2")"
+(( net1 <= bcast2 && net2 <= bcast1 ))
+}
+existing_tun_cidrs() {
+awk '
+FNR==1 { in_tun=0 }
+/^\[/ { in_tun = ($0 == "[tun]") }
+in_tun && /^(local_addr|remote_addr) = "/ {
+if (match($0, /"[^"]*"/)) print substr($0, RSTART+1, RLENGTH-2)
+}
+' "${config_dir}"/*.toml 2>/dev/null
+}
+toml_tun_name() {
+local file="$1"
+awk '
+FNR==1 { in_tun=0 }
+/^\[/ { in_tun = ($0 == "[tun]") }
+in_tun && /^name = "/ {
+if (match($0, /"[^"]*"/)) print substr($0, RSTART+1, RLENGTH-2)
+}
+' "$file" 2>/dev/null
+}
+toml_ipx_profile() {
+local file="$1"
+awk '
+FNR==1 { in_ipx=0 }
+/^\[/ { in_ipx = ($0 == "[ipx]") }
+in_ipx && /^profile = "/ {
+if (match($0, /"[^"]*"/)) print substr($0, RSTART+1, RLENGTH-2)
+}
+' "$file" 2>/dev/null
+}
+has_any_tun_config() {
+grep -l '^\[tun\]$' "${config_dir}"/*.toml 2>/dev/null | grep -q .
+}
+profile_still_in_use() {
+local profile="$1"
+local f
+for f in "${config_dir}"/*.toml; do
+[[ -f "$f" ]] || continue
+[[ "$(toml_ipx_profile "$f")" == "$profile" ]] && return 0
+done
+return 1
+}
+is_tun_subnet_in_use() {
+local cidr="$1"
+local existing
+while IFS= read -r existing; do
+[[ -z "$existing" ]] && continue
+if cidr_overlaps "$cidr" "$existing"; then
+return 0
+fi
+done <<< "$(existing_tun_cidrs)"
+return 1
+}
+suggest_tun_subnet_third_octet() {
+local used
+used=$(existing_tun_cidrs | grep -oE '^10\.10\.[0-9]{1,3}\.' | cut -d. -f3)
+local third=10
+while grep -qx "$third" <<< "$used"; do
+((third++))
+done
+echo "$third"
+}
+is_tun_name_in_use() {
+local name="$1"
+grep -qxF "name = \"${name}\"" "${config_dir}"/*.toml 2>/dev/null
+}
+is_tunnel_port_in_use() {
+local mode="$1"
+local port="$2"
+local prefix
+[[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
+[[ -f "${config_dir}/${prefix}${port}.toml" ]]
+}
+suggest_free_tunnel_port() {
+local mode="$1"
+local prefix
+[[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
+local port=1234
+while [[ -f "${config_dir}/${prefix}${port}.toml" ]]; do
+((port++))
+done
+echo "$port"
+}
+is_valid_tun_name() {
+local name="$1"
+[[ "$name" =~ ^[A-Za-z0-9_-]{1,15}$ ]]
+}
+suggest_tun_name() {
+local base="backhaul"
+local used
+used=$(grep -h -oE '^name = "[^"]*"' "${config_dir}"/*.toml 2>/dev/null | sed -E 's/^name = "(.*)"$/\1/')
+local candidate="$base"
+local n=1
+while grep -qx "$candidate" <<< "$used"; do
+((n++))
+candidate="${base}${n}"
+done
+echo "$candidate"
+}
+detect_default_interface() {
+local iface
+iface=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+if [[ -z "$iface" ]]; then
+iface=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+fi
+echo "$iface"
+}
+persist_line_once() {
+local line="$1"
+local file="$2"
+mkdir -p "$(dirname "$file")"
+touch "$file"
+grep -qxF "$line" "$file" || echo "$line" >> "$file"
+}
+prepare_tun_ipx_kernel() {
+local is_ipx="$1"
+local profile="$2"
+local tun_name="$3"
+colorize yellow "Applying kernel prerequisites for TUN..."
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
+persist_line_once "net.ipv4.ip_forward=1" "/etc/sysctl.d/99-backhaul-tunnel.conf"
+persist_line_once "net.ipv4.conf.all.rp_filter=0" "/etc/sysctl.d/99-backhaul-tunnel.conf"
+persist_line_once "net.ipv4.conf.default.rp_filter=0" "/etc/sysctl.d/99-backhaul-tunnel.conf"
+local rp_file
+for rp_file in /proc/sys/net/ipv4/conf/*/rp_filter; do
+{ echo 0 > "$rp_file"; } 2>/dev/null
+done
+sysctl -p /etc/sysctl.d/99-backhaul-tunnel.conf >/dev/null 2>&1
+if command -v iptables &> /dev/null && [[ -n "$tun_name" ]]; then
+local forward_changed="false"
+if ! iptables -C FORWARD -i "$tun_name" -j ACCEPT 2>/dev/null; then
+iptables -I FORWARD -i "$tun_name" -j ACCEPT
+forward_changed="true"
+fi
+if ! iptables -C FORWARD -o "$tun_name" -j ACCEPT 2>/dev/null; then
+iptables -I FORWARD -o "$tun_name" -j ACCEPT
+forward_changed="true"
+fi
+[[ "$forward_changed" == "true" ]] && persist_iptables_rules
+fi
+if [[ "$is_ipx" == "true" ]]; then
+local mod=""
+case "$profile" in
+gre) mod="ip_gre" ;;
+ipip) mod="ipip" ;;
+esac
+if [[ -n "$mod" ]] && command -v modprobe &> /dev/null; then
+lsmod | grep -qw "$mod" || modprobe "$mod" >/dev/null 2>&1
+persist_line_once "$mod" "/etc/modules-load.d/backhaul-tunnel.conf"
+fi
+fi
+colorize green "Kernel prerequisites applied."
+}
+persist_iptables_rules() {
+if command -v netfilter-persistent &> /dev/null; then
+netfilter-persistent save >/dev/null 2>&1
+elif command -v iptables-save &> /dev/null && [[ -d /etc/iptables ]]; then
+iptables-save > /etc/iptables/rules.v4 2>/dev/null
+else
+colorize yellow "Note: this iptables rule is not persisted across reboot (install iptables-persistent to persist)."
+fi
+}
+allow_ipx_protocol_firewall() {
+local profile="$1"
+local proto=""
+case "$profile" in
+gre) proto="47" ;;
+ipip) proto="4" ;;
+icmp) proto="icmp" ;;
+*) return 0 ;;
+esac
+# ufw's `proto` option only recognizes a small keyword whitelist (no raw protocol
+# numbers, and no "ipip" keyword at all), so iptables is the actual enforcement here
+# regardless of ufw; inserting at the head of INPUT means it takes effect even when
+# ufw is separately active, since ACCEPT there is terminal for matching packets.
+if command -v iptables &> /dev/null; then
+if ! iptables -C INPUT -p "$proto" -j ACCEPT 2>/dev/null; then
+iptables -I INPUT -p "$proto" -j ACCEPT
+colorize green "Firewall rule added: allow protocol ${proto} (iptables)"
+persist_iptables_rules
+fi
+else
+colorize yellow "iptables not found; cannot automatically open protocol ${proto} in the firewall."
+fi
+if [[ "$profile" == "gre" ]] && command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+ufw allow proto gre from any to any comment "backhaul-ipx-gre" >/dev/null 2>&1
+fi
+}
+test_tun_connectivity() {
+local remote_cidr="$1"
+local service_name="$2"
+local remote_ip="${remote_cidr%/*}"
+if ! command -v ping &> /dev/null; then
+colorize yellow "ping not found; skipping automatic connectivity test."
+return
+fi
+colorize yellow "Testing TUN connectivity to ${remote_ip} ..."
+sleep 3
+if ping -c 3 -W 2 "$remote_ip" &> /dev/null; then
+colorize green "✔ TUN link is up — ${remote_ip} is reachable."
+else
+colorize red "✘ Could not reach ${remote_ip} over the TUN link yet."
+colorize yellow "This can be normal if the other side isn't up yet. Check logs with: journalctl -eu ${service_name} -f"
+fi
+echo ""
 }
 install_jq() {
 if ! command -v jq &> /dev/null; then
@@ -281,31 +513,66 @@ local mode="$2"
 local is_ipx="$3"
 [[ "$transport" != "tun" ]] && return
 colorize blue "━━━ TUN Configuration ━━━" bold
-prompt_with_default "TUN Device Name" "backhaul" CONFIG[tun_name]
+local suggested_name
+suggested_name=$(suggest_tun_name)
+while true; do
+prompt_with_default "TUN Device Name" "$suggested_name" CONFIG[tun_name]
+if ! is_valid_tun_name "${CONFIG[tun_name]}"; then
+colorize red "Invalid name. Use up to 15 letters/digits/-/_ characters (Linux interface name limit)."
+elif is_tun_name_in_use "${CONFIG[tun_name]}"; then
+colorize red "Device name '${CONFIG[tun_name]}' is already used by another tunnel on this server. Choose another."
+else
+break
+fi
+done
+local suggested_third
+suggested_third=$(suggest_tun_subnet_third_octet)
 local default_local default_remote
 if [[ "$mode" == "server" ]]; then
-default_local="10.10.10.1/24"
-default_remote="10.10.10.2/24"
+default_local="10.10.${suggested_third}.1/24"
+default_remote="10.10.${suggested_third}.2/24"
 else
-default_local="10.10.10.2/24"
-default_remote="10.10.10.1/24"
+default_local="10.10.${suggested_third}.2/24"
+default_remote="10.10.${suggested_third}.1/24"
 fi
 while true; do
 prompt_with_default "TUN Local Address (CIDR)" "$default_local" CONFIG[tun_local_addr]
-if validate_cidr "${CONFIG[tun_local_addr]}"; then
-break
+if ! validate_cidr "${CONFIG[tun_local_addr]}"; then
+colorize red "Invalid CIDR format."
+continue
 fi
-local suggested=$(validate_cidr "${CONFIG[tun_local_addr]}" 2>&1)
-colorize red "Invalid CIDR. Network address should be: $suggested"
+if is_tun_subnet_in_use "${CONFIG[tun_local_addr]}"; then
+colorize red "This subnet overlaps with an existing tunnel's TUN subnet. Choose a different one."
+continue
+fi
+break
 done
 while true; do
 prompt_with_default "TUN Remote Address (CIDR)" "$default_remote" CONFIG[tun_remote_addr]
-if validate_cidr "${CONFIG[tun_remote_addr]}"; then
+if ! validate_cidr "${CONFIG[tun_remote_addr]}"; then
+colorize red "Invalid CIDR format."
+continue
+fi
+if is_tun_subnet_in_use "${CONFIG[tun_remote_addr]}"; then
+colorize red "This subnet overlaps with an existing tunnel's TUN subnet. Choose a different one."
+continue
+fi
+break
+done
+if [[ "$is_ipx" == "true" ]]; then
+local suggested_port
+suggested_port=$(suggest_free_tunnel_port "$mode")
+while true; do
+prompt_with_default "Health Port" "$suggested_port" CONFIG[tun_health_port]
+if is_tunnel_port_in_use "$mode" "${CONFIG[tun_health_port]}"; then
+colorize red "Port ${CONFIG[tun_health_port]} is already used by another ${mode} tunnel on this server. Choose another."
+else
 break
 fi
-colorize red "Invalid CIDR format."
 done
+else
 prompt_with_default "Health Port" "1234" CONFIG[tun_health_port]
+fi
 if [[ "$is_ipx" == "true" ]]; then
 prompt_with_default "MTU" "1320" CONFIG[tun_mtu]
 else
@@ -439,8 +706,8 @@ break
 fi
 colorize red "Destination IP cannot be empty."
 done
-interface=$(ip route show default | awk '{print $5}')
-prompt_with_default "Network Interface" $interface CONFIG[ipx_interface]
+interface=$(detect_default_interface)
+prompt_with_default "Network Interface" "$interface" CONFIG[ipx_interface]
 if [[ "${CONFIG[ipx_profile]}" == "icmp" ]]; then
 prompt_with_default "ICMP Type" "0" CONFIG[ipx_icmp_type]
 prompt_with_default "ICMP Code" "0" CONFIG[ipx_icmp_code]
@@ -610,7 +877,16 @@ fi
 generate_toml_config "$mode" "$config_file" "$is_tun" "$is_ipx"
 local service_type
 [[ "$mode" == "server" ]] && service_type="iran" || service_type="kharej"
+if [[ "$is_tun" == "true" ]]; then
+prepare_tun_ipx_kernel "$is_ipx" "${CONFIG[ipx_profile]}" "${CONFIG[tun_name]}"
+fi
+if [[ "$is_ipx" == "true" ]]; then
+allow_ipx_protocol_firewall "${CONFIG[ipx_profile]}"
+fi
 create_systemd_service "$service_type" "$tunnel_port" "$config_file"
+if [[ "$is_tun" == "true" ]]; then
+test_tun_connectivity "${CONFIG[tun_remote_addr]}" "backhaul-${service_type}${tunnel_port}.service"
+fi
 echo ""
 colorize green "✔ Configuration completed successfully!" bold
 echo ""
@@ -829,12 +1105,41 @@ config_path="$1"
 config_name=$(basename "${config_path%.toml}")
 service_name="backhaul-${config_name}.service"
 service_path="$service_dir/$service_name"
+local removed_tun_name removed_profile
+removed_tun_name=$(toml_tun_name "$config_path")
+removed_profile=$(toml_ipx_profile "$config_path")
 [ -f "$config_path" ] && rm -f "$config_path"
 if [[ -f "$service_path" ]]; then
 systemctl is-active --quiet "$service_name" && systemctl disable --now "$service_name" >/dev/null 2>&1
 rm -f "$service_path"
 fi
 systemctl daemon-reload
+if [[ -n "$removed_tun_name" ]] && command -v iptables &> /dev/null; then
+iptables -D FORWARD -i "$removed_tun_name" -j ACCEPT 2>/dev/null
+iptables -D FORWARD -o "$removed_tun_name" -j ACCEPT 2>/dev/null
+persist_iptables_rules
+fi
+if [[ -n "$removed_profile" ]] && ! profile_still_in_use "$removed_profile"; then
+local proto="" mod=""
+case "$removed_profile" in
+gre) proto="47"; mod="ip_gre" ;;
+ipip) proto="4"; mod="ipip" ;;
+icmp) proto="icmp" ;;
+esac
+if [[ -n "$proto" ]] && command -v iptables &> /dev/null; then
+iptables -D INPUT -p "$proto" -j ACCEPT 2>/dev/null
+persist_iptables_rules
+fi
+if [[ "$removed_profile" == "gre" ]] && command -v ufw &> /dev/null; then
+ufw delete allow proto gre from any to any comment "backhaul-ipx-gre" >/dev/null 2>&1
+fi
+if [[ -n "$mod" ]]; then
+sed -i "/^${mod}\$/d" "/etc/modules-load.d/backhaul-tunnel.conf" 2>/dev/null
+fi
+fi
+if ! has_any_tun_config; then
+colorize yellow "Note: no TUN tunnels remain on this server, but the ip_forward/rp_filter kernel settings applied earlier are system-wide and were left in place. Revert them manually via /etc/sysctl.d/99-backhaul-tunnel.conf if nothing else on this box needs them."
+fi
 echo
 colorize green "Tunnel destroyed successfully!" bold
 echo
