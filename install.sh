@@ -16,14 +16,23 @@ exit 1
 fi
 
 mkdir -p "$CONFIG_DIR"
+mkdir -p "$(dirname "$PANEL_PATH")"
 
+# Download to a temp file in the SAME directory as the final path, then move it
+# into place atomically. A previous tunnel's systemd service may currently be
+# running this exact binary/script, and overwriting a running executable
+# in place can fail (or corrupt it) on Linux; an atomic rename never does.
 echo "Downloading Backhaul core..."
-curl -fsSL "$REPO_RAW/backhaul_premium" -o "$CONFIG_DIR/backhaul_premium"
-chmod +x "$CONFIG_DIR/backhaul_premium"
+TMP_CORE=$(mktemp "${CONFIG_DIR}/.backhaul_premium.XXXXXX")
+curl -fsSL "$REPO_RAW/backhaul_premium" -o "$TMP_CORE"
+chmod +x "$TMP_CORE"
+mv -f "$TMP_CORE" "$CONFIG_DIR/backhaul_premium"
 
 echo "Downloading management panel..."
-curl -fsSL "$REPO_RAW/backhaul.sh" -o "$PANEL_PATH"
-chmod +x "$PANEL_PATH"
+TMP_PANEL=$(mktemp "$(dirname "$PANEL_PATH")/.backhaul.XXXXXX")
+curl -fsSL "$REPO_RAW/backhaul.sh" -o "$TMP_PANEL"
+chmod +x "$TMP_PANEL"
+mv -f "$TMP_PANEL" "$PANEL_PATH"
 
 echo "Installed. Launching panel..."
 echo ""
