@@ -25,6 +25,22 @@ mkdir -p "$(dirname "$PANEL_PATH")"
 echo "Downloading Backhaul core..."
 TMP_CORE=$(mktemp "${CONFIG_DIR}/.backhaul_premium.XXXXXX")
 curl -fsSL "$REPO_RAW/backhaul_premium" -o "$TMP_CORE"
+
+EXPECTED_SHA=$(curl -fsSL "$REPO_RAW/backhaul_premium.sha256" 2>/dev/null | awk '{print $1}')
+if [[ -n "$EXPECTED_SHA" ]]; then
+ACTUAL_SHA=""
+if command -v sha256sum &> /dev/null; then
+ACTUAL_SHA=$(sha256sum "$TMP_CORE" | awk '{print $1}')
+elif command -v openssl &> /dev/null; then
+ACTUAL_SHA=$(openssl dgst -sha256 "$TMP_CORE" | awk '{print $NF}')
+fi
+if [[ -n "$ACTUAL_SHA" && "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+echo "Checksum mismatch for backhaul_premium (expected $EXPECTED_SHA, got $ACTUAL_SHA). Aborting." >&2
+rm -f "$TMP_CORE"
+exit 1
+fi
+fi
+
 chmod +x "$TMP_CORE"
 mv -f "$TMP_CORE" "$CONFIG_DIR/backhaul_premium"
 

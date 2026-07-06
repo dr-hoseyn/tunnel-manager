@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 SCRIPT_VERSION="v1.0.0"
+SCRIPT_MODE="$1"
+PANEL_PATH="/usr/local/bin/backhaul"
 service_dir="/etc/systemd/system"
 config_dir="/root/backhaul-core"
 CERT_DIR="/root/backhaul-core/cert_files"
@@ -276,6 +278,92 @@ else
 colorize yellow "Note: this iptables rule is not persisted across reboot (install iptables-persistent to persist)."
 fi
 }
+allow_forwarded_ports_firewall() {
+local mapping="$1" accept_udp="$2" entry listen proto
+local -a protos=(tcp)
+[[ "$accept_udp" == "true" ]] && protos+=(udp)
+local -a entries=()
+IFS=',' read -r -a entries <<< "$mapping"
+local changed="false"
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+[[ -z "$entry" ]] && continue
+listen="${entry%%[=:]*}"
+listen="${listen//-/:}"
+[[ -z "$listen" ]] && continue
+for proto in "${protos[@]}"; do
+if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+ufw allow "${listen}/${proto}" >/dev/null 2>&1
+elif command -v iptables &> /dev/null; then
+if ! iptables -C INPUT -p "$proto" --dport "$listen" -j ACCEPT 2>/dev/null; then
+iptables -I INPUT -p "$proto" --dport "$listen" -j ACCEPT
+changed="true"
+fi
+fi
+done
+done
+[[ "$changed" == "true" ]] && command -v iptables &> /dev/null && persist_iptables_rules
+}
+ensure_watchdog_installed() {
+local unit_service="${service_dir}/backhaul-watchdog.service"
+local unit_timer="${service_dir}/backhaul-watchdog.timer"
+if [[ -f "$unit_timer" ]] && systemctl is-enabled --quiet backhaul-watchdog.timer 2>/dev/null; then
+return
+fi
+cat > "$unit_service" <<EOF
+[Unit]
+Description=Backhaul tunnel watchdog
+
+[Service]
+Type=oneshot
+ExecStart=${PANEL_PATH} --watchdog
+EOF
+cat > "$unit_timer" <<EOF
+[Unit]
+Description=Run Backhaul watchdog periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
+}
+run_watchdog_check() {
+local config_path config_name service_name is_tun tun_name
+for config_path in "${config_dir}"/{iran,kharej}*.toml; do
+[[ -f "$config_path" ]] || continue
+config_name=$(basename "${config_path%.toml}")
+service_name="backhaul-${config_name}.service"
+if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
+logger -t backhaul-watchdog "${service_name} is inactive, restarting" 2>/dev/null
+systemctl restart "$service_name" 2>/dev/null
+continue
+fi
+is_tun="false"; tunnel_is_tun "$config_path" && is_tun="true"
+if [[ "$is_tun" == "true" ]]; then
+tun_name=$(toml_tun_name "$config_path")
+if [[ -n "$tun_name" ]] && ! tun_iface_exists "$tun_name"; then
+logger -t backhaul-watchdog "${service_name} TUN interface ${tun_name} is down, restarting" 2>/dev/null
+systemctl restart "$service_name" 2>/dev/null
+fi
+fi
+done
+}
+ensure_journal_limits() {
+local conf_dir="/etc/systemd/journald.conf.d"
+local conf_file="${conf_dir}/backhaul-tunnel.conf"
+[[ -f "$conf_file" ]] && return
+mkdir -p "$conf_dir" 2>/dev/null
+cat > "$conf_file" <<EOF
+[Journal]
+SystemMaxUse=200M
+EOF
+systemctl restart systemd-journald >/dev/null 2>&1
+}
 allow_ipx_protocol_firewall() {
 local profile="$1"
 local proto=""
@@ -404,6 +492,20 @@ echo "${avg:-NA} ${loss:-NA}"
 tun_iface_exists() {
 ip link show "$1" &>/dev/null
 }
+tunnel_traffic_stats() {
+local service_name="$1" rx tx
+rx=$(systemctl show "$service_name" -p IPIngressBytes --value 2>/dev/null)
+tx=$(systemctl show "$service_name" -p IPEgressBytes --value 2>/dev/null)
+if [[ -z "$rx" || "$rx" == "[not set]" || "$rx" == "18446744073709551615" ]]; then
+echo ""
+return
+fi
+if command -v numfmt &> /dev/null; then
+rx=$(numfmt --to=iec --suffix=B "$rx" 2>/dev/null)
+tx=$(numfmt --to=iec --suffix=B "$tx" 2>/dev/null)
+fi
+echo "RX ${rx:-0}  TX ${tx:-0}"
+}
 local_role_ready() {
 local config_path="$1" is_tun="$2" tun_name="$3" config_name service_name
 config_name=$(basename "${config_path%.toml}")
@@ -521,12 +623,19 @@ fi
 fi
 }
 download_and_extract_backhaul() {
+local is_menu="false" backup_bin=""
 if [[ "$1" == "menu" ]]; then
-rm -rf "${config_dir}/backhaul_premium" >/dev/null 2>&1
+is_menu="true"
+if [[ -f "${config_dir}/backhaul_premium" ]]; then
+backup_bin="${config_dir}/.backhaul_premium.prev"
+cp -p "${config_dir}/backhaul_premium" "$backup_bin"
+fi
+rm -f "${config_dir}/backhaul_premium" >/dev/null 2>&1
 colorize cyan "Restart all services after updating to new core" bold
 sleep 2
-fi
+else
 [[ -f "${config_dir}/backhaul_premium" ]] && return 1
+fi
 ARCH=$(uname -m)
 case "$ARCH" in
 x86_64)
@@ -539,22 +648,46 @@ FALLBACK_URL="http://ir.backhaul-dev.com:2095/backhaul_premium_arm64.tar.gz"
 ;;
 *)
 colorize red "Unsupported architecture: $ARCH."
+[[ -n "$backup_bin" ]] && mv -f "$backup_bin" "${config_dir}/backhaul_premium"
+[[ "$is_menu" == "true" ]] && return 1
 exit 1
 ;;
 esac
 DOWNLOAD_DIR=$(mktemp -d)
 echo "Downloading Backhaul..."
+local download_ok="true"
 if ! curl -sSL --max-time 10 -o "$DOWNLOAD_DIR/backhaul.tar.gz" "$PRIMARY_URL"; then
 colorize yellow "Primary download failed. Trying fallback..."
-curl -sSL --max-time 30 -o "$DOWNLOAD_DIR/backhaul.tar.gz" "$FALLBACK_URL" || {
+if ! curl -sSL --max-time 30 -o "$DOWNLOAD_DIR/backhaul.tar.gz" "$FALLBACK_URL"; then
 colorize red "Download failed."
+download_ok="false"
+fi
+fi
+if [[ "$download_ok" == "false" ]]; then
 rm -rf "$DOWNLOAD_DIR"
+if [[ -n "$backup_bin" ]]; then
+mv -f "$backup_bin" "${config_dir}/backhaul_premium"
+colorize yellow "Restored the previous core."
+fi
+[[ "$is_menu" == "true" ]] && { press_key; return 1; }
 exit 1
-}
 fi
 mkdir -p "$config_dir"
 tar -xzf "$DOWNLOAD_DIR/backhaul.tar.gz" -C "$config_dir"
 chmod u+x "${config_dir}/backhaul_premium"
+rm -rf "$DOWNLOAD_DIR"
+if ! "${config_dir}/backhaul_premium" -v &> /dev/null; then
+colorize red "New core failed a basic sanity check (backhaul_premium -v)."
+if [[ -n "$backup_bin" ]]; then
+mv -f "$backup_bin" "${config_dir}/backhaul_premium"
+colorize yellow "Restored the previous core."
+else
+colorize red "No previous core available to restore!"
+fi
+[[ "$is_menu" == "true" ]] && { press_key; return 1; }
+exit 1
+fi
+[[ -n "$backup_bin" ]] && rm -f "$backup_bin"
 colorize green "Backhaul installation completed."
 }
 install_jq
@@ -1080,12 +1213,17 @@ fi
 if [[ "$is_ipx" == "true" ]]; then
 allow_ipx_protocol_firewall "${CONFIG[ipx_profile]}"
 fi
+if [[ "$mode" == "server" ]]; then
+allow_forwarded_ports_firewall "${CONFIG[ports_mapping]}" "${CONFIG[accept_udp]}"
+fi
 create_systemd_service "$service_type" "$tunnel_port" "$config_file"
 local config_name
 config_name=$(basename "${config_file%.toml}")
 local peer_ip_for_meta="${CONFIG[peer_ip]}"
 [[ -z "$peer_ip_for_meta" && "$is_ipx" == "true" ]] && peer_ip_for_meta="${CONFIG[ipx_dst_ip]}"
 write_tunnel_meta "$config_name" "$peer_ip_for_meta" "${CONFIG[peer_ssh_port]}"
+ensure_watchdog_installed
+ensure_journal_limits
 echo ""
 colorize green "✔ Configuration completed successfully!" bold
 echo ""
@@ -1110,6 +1248,7 @@ RestartSec=3
 LimitNOFILE=1048576
 TasksMax=infinity
 LimitMEMLOCK=infinity
+IPAccounting=yes
 StandardOutput=journal
 StandardError=journal
 [Install]
@@ -1195,6 +1334,7 @@ RestartSec=3
 LimitNOFILE=1048576
 TasksMax=infinity
 LimitMEMLOCK=infinity
+IPAccounting=yes
 StandardOutput=journal
 StandardError=journal
 [Install]
@@ -1269,17 +1409,44 @@ echo -e "\033[35m${index}\033[0m) \033[32mKharej\033[0m (port: \033[33m$port\033
 fi
 done
 echo
+colorize yellow "R) Restart all tunnels"
+echo
 echo -ne "Enter your choice (0 to return): "
 read -r choice
 [[ "$choice" == "0" ]] && return
+if [[ "$choice" =~ ^[Rr]$ ]]; then
+restart_all_tunnels
+return
+fi
 while ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#configs[@]} )); do
 colorize red "Invalid choice."
 echo -ne "Enter your choice (0 to return): "
 read -r choice
 [[ "$choice" == "0" ]] && return
+[[ "$choice" =~ ^[Rr]$ ]] && { restart_all_tunnels; return; }
 done
 selected_config="${configs[$((choice - 1))]}"
 tunnel_detail_page "$selected_config"
+}
+restart_all_tunnels() {
+local config_path config_name service_name
+clear
+colorize yellow "Restarting all tunnels..." bold
+echo ""
+for config_path in "${config_dir}"/{iran,kharej}*.toml; do
+[[ -f "$config_path" ]] || continue
+config_name=$(basename "${config_path%.toml}")
+service_name="backhaul-${config_name}.service"
+systemctl restart "$service_name" 2>/dev/null
+sleep 1
+if systemctl is-active --quiet "$service_name"; then
+colorize green "✔ ${service_name} restarted"
+else
+colorize red "✘ ${service_name} failed to restart"
+fi
+done
+echo ""
+press_key
 }
 load_toml_ports_mapping() {
 awk '
@@ -1384,6 +1551,7 @@ inarr && /^\]/ { print; inarr=0; next }
 inarr { next }
 { print }
 ' "$config_path" > "${config_path}.new" && mv "${config_path}.new" "$config_path"
+allow_forwarded_ports_firewall "$new_mapping" "$(toml_get "$config_path" "transport" "accept_udp")"
 systemctl restart "$service_name"
 sleep 2
 if systemctl is-active --quiet "$service_name"; then
@@ -1519,6 +1687,9 @@ prepare_tun_ipx_kernel "$is_ipx" "${CONFIG[ipx_profile]}" "${CONFIG[tun_name]}"
 fi
 if [[ "$is_ipx" == "true" ]]; then
 allow_ipx_protocol_firewall "${CONFIG[ipx_profile]}"
+fi
+if [[ "$mode" == "server" ]]; then
+allow_forwarded_ports_firewall "${CONFIG[ports_mapping]}" "${CONFIG[accept_udp]}"
 fi
 local peer_ip_for_meta="${CONFIG[peer_ip]}"
 [[ -z "$peer_ip_for_meta" && "$is_ipx" == "true" ]] && peer_ip_for_meta="${CONFIG[ipx_dst_ip]}"
@@ -1742,6 +1913,13 @@ if [[ "$role" == "server" ]]; then
 ports_count=$(load_toml_ports_mapping "$config_path" | tr ',' '\n' | grep -c .)
 echo "Forwarded ports: ${ports_count:-0}"
 fi
+local traffic
+traffic=$(tunnel_traffic_stats "$service_name")
+if [[ -n "$traffic" ]]; then
+echo "Traffic: ${traffic}"
+else
+echo "Traffic: N/A (re-save via Edit to enable tracking on this tunnel)"
+fi
 echo ""
 colorize green "1) Edit tunnel"
 colorize cyan "2) Retest (Diagnostics)"
@@ -1847,19 +2025,23 @@ fi
 press_key
 }
 update_script() {
-return
-DEST_DIR="/usr/bin/"
-BACKHAUL_SCRIPT="backhaul"
-SCRIPT_URL="http://ir.backhaul-dev.com:2095/backhaul.sh"
-[ -f "$DEST_DIR/$BACKHAUL_SCRIPT" ] && rm "$DEST_DIR/$BACKHAUL_SCRIPT"
-if curl -s -L -o "$DEST_DIR/$BACKHAUL_SCRIPT" "$SCRIPT_URL"; then
-chmod +x "$DEST_DIR/$BACKHAUL_SCRIPT"
-colorize yellow "Type 'backhaul' to run the script." bold
-exit 0
+local script_url="https://raw.githubusercontent.com/dr-hoseyn/tunnel-manager/main/backhaul.sh"
+local target="$PANEL_PATH"
+[[ -f "$target" ]] || target="$0"
+colorize yellow "Updating management script..."
+local tmp
+tmp=$(mktemp "$(dirname "$target")/.backhaul.XXXXXX")
+if curl -fsSL "$script_url" -o "$tmp"; then
+chmod +x "$tmp"
+mv -f "$tmp" "$target"
+colorize green "✔ Script updated. Restarting..."
+sleep 1
+exec bash "$target"
 else
-colorize red "Download failed."
-fi
+colorize red "✘ Download failed."
+rm -f "$tmp"
 press_key
+fi
 }
 configure_tunnel() {
 [[ ! -d "$config_dir" ]] && {
@@ -1907,6 +2089,10 @@ case $choice in
 *) colorize red "Invalid option!" && sleep 1 ;;
 esac
 }
+if [[ "$SCRIPT_MODE" == "--watchdog" ]]; then
+run_watchdog_check
+exit 0
+fi
 while true; do
 display_menu
 read_option
