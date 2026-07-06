@@ -714,6 +714,23 @@ echo "${avg:-NA} ${loss:-NA}"
 tun_iface_exists() {
 ip link show "$1" &>/dev/null
 }
+check_health_endpoint() {
+local port="$1" http_code
+[[ -z "$port" ]] && { echo "N/A"; return 1; }
+if command -v curl &> /dev/null; then
+http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${port}/" 2>/dev/null)
+if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+echo "OK"
+return 0
+fi
+fi
+if tcp_port_open "127.0.0.1" "$port" 2; then
+echo "OPEN"
+return 0
+fi
+echo "DOWN"
+return 1
+}
 tunnel_traffic_stats() {
 local service_name="$1" rx tx
 rx=$(systemctl show "$service_name" -p IPIngressBytes --value 2>/dev/null)
@@ -767,6 +784,18 @@ if [[ "$ROLE_READY" == "1" ]]; then
 colorize green "✔ ${my_label} side is ready"
 else
 colorize red "✘ ${my_label} side is not ready — ${ROLE_REASON}"
+fi
+if [[ "$is_tun" == "true" ]]; then
+local health_port health_status
+health_port=$(toml_get "$config_path" "tun" "health_port")
+if [[ -n "$health_port" ]]; then
+health_status=$(check_health_endpoint "$health_port")
+case "$health_status" in
+OK) colorize green "✔ Health endpoint (:${health_port}): responding" ;;
+OPEN) colorize yellow "Health endpoint (:${health_port}): port open but no HTTP response (may not be an HTTP endpoint)" ;;
+*) colorize red "✘ Health endpoint (:${health_port}): not responding" ;;
+esac
+fi
 fi
 echo ""
 
@@ -2206,6 +2235,7 @@ done
 }
 destroy_tunnel() {
 config_path="$1"
+local silent="${2:-}"
 config_name=$(basename "${config_path%.toml}")
 service_name="backhaul-${config_name}.service"
 service_path="$service_dir/$service_name"
@@ -2227,6 +2257,7 @@ systemctl daemon-reload
 if [[ -n "$removed_tun_name" ]] && command -v iptables &> /dev/null; then
 iptables -D FORWARD -i "$removed_tun_name" -j ACCEPT 2>/dev/null
 iptables -D FORWARD -o "$removed_tun_name" -j ACCEPT 2>/dev/null
+iptables -t nat -D POSTROUTING -o "$removed_tun_name" -j MASQUERADE 2>/dev/null
 persist_iptables_rules
 fi
 if [[ -n "$removed_profile" ]] && ! profile_still_in_use "$removed_profile"; then
@@ -2247,6 +2278,7 @@ if [[ -n "$mod" ]]; then
 sed -i "/^${mod}\$/d" "/etc/modules-load.d/backhaul-tunnel.conf" 2>/dev/null
 fi
 fi
+if [[ "$silent" != "--silent" ]]; then
 if ! has_any_tun_config; then
 colorize yellow "Note: no TUN tunnels remain on this server, but the ip_forward/rp_filter kernel settings applied earlier are system-wide and were left in place. Revert them manually via /etc/sysctl.d/99-backhaul-tunnel.conf if nothing else on this box needs them."
 fi
@@ -2254,6 +2286,9 @@ echo
 colorize green "Tunnel destroyed successfully!" bold
 echo
 press_key
+else
+colorize green "✔ Removed ${config_name}"
+fi
 }
 restart_service() {
 echo
@@ -2289,6 +2324,55 @@ if [[ $confirm == [yY] ]]; then
 colorize green "Backhaul-Core removed." bold
 fi
 press_key
+}
+uninstall_everything() {
+clear
+colorize red "═══════════════════════════════════════" bold
+colorize red "  FULL UNINSTALL — THIS IS DESTRUCTIVE" bold
+colorize red "═══════════════════════════════════════" bold
+echo ""
+echo "This will:"
+echo "  - Stop and remove every configured tunnel and its firewall/forwarding rules"
+echo "  - Remove the watchdog timer"
+echo "  - Remove the journald size-limit and sysctl (ip_forward/rp_filter) drop-ins"
+echo "  - Remove any HAProxy/IPVS config this panel created (not the packages themselves)"
+echo "  - Delete ${config_dir} (all configs, certs, backups, the core binary)"
+echo "  - Delete this panel script (${PANEL_PATH})"
+echo ""
+colorize yellow "This cannot be undone."
+echo ""
+local confirm
+read -r -p "Type UNINSTALL (all caps) to proceed, anything else to cancel: " confirm
+if [[ "$confirm" != "UNINSTALL" ]]; then
+colorize yellow "Cancelled."
+press_key
+return
+fi
+echo ""
+colorize yellow "Removing all tunnels..."
+local config_path
+for config_path in "${config_dir}"/{iran,kharej}*.toml; do
+[[ -f "$config_path" ]] || continue
+destroy_tunnel "$config_path" --silent
+done
+colorize yellow "Removing watchdog timer..."
+systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1
+rm -f "${service_dir}/backhaul-watchdog.timer" "${service_dir}/backhaul-watchdog.service"
+systemctl daemon-reload
+colorize yellow "Removing journald and sysctl drop-ins..."
+rm -f /etc/systemd/journald.conf.d/backhaul-tunnel.conf
+systemctl restart systemd-journald >/dev/null 2>&1
+rm -f /etc/sysctl.d/99-backhaul-tunnel.conf
+rm -f /etc/modules-load.d/backhaul-tunnel.conf
+colorize yellow "Removing config directory..."
+rm -rf "$config_dir"
+colorize green "✔ Backhaul fully removed."
+sleep 1
+colorize yellow "Deleting this script..."
+rm -f "$PANEL_PATH"
+echo ""
+colorize green "Done. Goodbye."
+exit 0
 }
 update_script() {
 local script_url="https://raw.githubusercontent.com/dr-hoseyn/tunnel-manager/main/backhaul.sh"
@@ -2339,11 +2423,12 @@ colorize cyan " 3. Check tunnel status" bold
 echo " 4. Update Backhaul Core"
 echo " 5. Update script"
 echo " 6. Remove Backhaul Core"
+colorize red " 7. Uninstall everything" bold
 echo " 0. Exit"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 read_option() {
-read -r -p "Enter your choice [0-6]: " choice
+read -r -p "Enter your choice [0-7]: " choice
 case $choice in
 1) configure_tunnel ;;
 2) tunnel_management ;;
@@ -2351,6 +2436,7 @@ case $choice in
 4) download_and_extract_backhaul "menu" ;;
 5) update_script ;;
 6) remove_core ;;
+7) uninstall_everything ;;
 0) exit 0 ;;
 *) colorize red "Invalid option!" && sleep 1 ;;
 esac
