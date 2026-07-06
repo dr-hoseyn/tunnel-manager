@@ -1620,11 +1620,13 @@ fi
 score_result() {
 local latency="$1" loss="$2"
 if [[ "$latency" == "NA" ]]; then echo 999999; return; fi
+latency=$(printf "%.0f" "$latency")
 echo $(( latency + loss*20 ))
 }
 status_label() {
 local latency="$1" loss="$2"
 if [[ "$latency" == "NA" ]]; then echo "Unusable"; return; fi
+latency=$(printf "%.0f" "$latency")
 if (( loss == 0 && latency < 80 )); then echo "Excellent"
 elif (( loss <= 2 && latency < 150 )); then echo "Good"
 elif (( loss <= 5 && latency < 300 )); then echo "Fair"
@@ -1640,16 +1642,23 @@ colorize red "Peer IP is not set — set it from the Edit menu first."
 press_key
 return 1
 fi
+local port_source="tunnel"
 port=$(tunnel_port_number "$config_path" "$(tunnel_role "$config_path")")
-[[ -z "$port" ]] && port=$(tunnel_peer_ssh_port "$config_name")
+if [[ -z "$port" ]]; then
+port=$(tunnel_peer_ssh_port "$config_name")
+port_source="SSH"
+fi
 
 clear
 colorize cyan "Protocol Benchmark — target: ${peer_ip}" bold
 colorize yellow "Note: real throughput needs iperf3 running on the peer (iperf3 -s), otherwise it shows N/A. The GRE/IPIP test only checks whether the protocol passes through firewalls on the path (needs hping3) — it is not a live tunnel benchmark, since that needs matching config on both sides at once."
+if [[ "$port_source" == "SSH" ]]; then
+colorize yellow "No tunnel port on record for this config; the TCP test will probe the SSH port (${port}) instead, which may have its own separate access restrictions."
+fi
 echo ""
 
 local -A RESULTS
-colorize yellow "Testing TCP..."
+colorize yellow "Testing TCP (port ${port})..."
 RESULTS[tcp]=$(benchmark_tcp_probe "$peer_ip" "$port")
 colorize yellow "Testing ICMP..."
 RESULTS[icmp]=$(benchmark_icmp_probe "$peer_ip")
@@ -1664,7 +1673,7 @@ echo ""
 local best_key="" best_score=999999999 i=1 key label lat loss thr status score
 for key in tcp icmp; do
 IFS=' ' read -r lat loss thr <<< "${RESULTS[$key]}"
-[[ "$key" == "tcp" ]] && label="TCP Tunnel" || label="ICMP Tunnel"
+[[ "$key" == "tcp" ]] && label="TCP Tunnel (port ${port})" || label="ICMP Tunnel"
 status=$(status_label "$lat" "$loss")
 score=$(score_result "$lat" "$loss")
 echo "$i. $label"
