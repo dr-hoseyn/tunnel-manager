@@ -302,23 +302,211 @@ if [[ "$profile" == "gre" ]] && command -v ufw &> /dev/null && ufw status | grep
 ufw allow proto gre from any to any comment "backhaul-ipx-gre" >/dev/null 2>&1
 fi
 }
-test_tun_connectivity() {
-local remote_cidr="$1"
-local service_name="$2"
-local remote_ip="${remote_cidr%/*}"
-if ! command -v ping &> /dev/null; then
-colorize yellow "ping not found; skipping automatic connectivity test."
+tunnel_meta_file() {
+echo "${config_dir}/.meta/$1.meta"
+}
+write_tunnel_meta() {
+local config_name="$1" peer_ip="$2" peer_ssh_port="$3"
+mkdir -p "${config_dir}/.meta"
+{
+echo "peer_ip=${peer_ip}"
+echo "peer_ssh_port=${peer_ssh_port:-22}"
+} > "$(tunnel_meta_file "$config_name")"
+}
+read_tunnel_meta() {
+local config_name="$1" key="$2" meta_file
+meta_file=$(tunnel_meta_file "$config_name")
+[[ -f "$meta_file" ]] || return 1
+grep "^${key}=" "$meta_file" 2>/dev/null | tail -1 | cut -d= -f2-
+}
+write_tunnel_last_test() {
+local config_name="$1" result="$2"
+mkdir -p "${config_dir}/.status"
+echo "${result}|$(date '+%Y-%m-%d %H:%M:%S')" > "${config_dir}/.status/${config_name}.status"
+}
+read_tunnel_last_test() {
+local config_name="$1"
+local f="${config_dir}/.status/${config_name}.status"
+[[ -f "$f" ]] && cat "$f" || echo "هنوز تست نشده|-"
+}
+toml_get() {
+local file="$1" section="$2" key="$3"
+awk -v want_section="[$section]" -v want_key="$key" '
+FNR==1 { insec=0 }
+/^\[/ { insec = ($0 == want_section) }
+insec {
+n = length(want_key)
+if (substr($0,1,n) == want_key && substr($0,n+1,1) ~ /[ =]/) {
+line=$0
+sub(/^[^=]*=[ \t]*/, "", line)
+gsub(/^"|"$/, "", line)
+print line
+exit
+}
+}
+' "$file" 2>/dev/null
+}
+tunnel_role() {
+local file="$1"
+if grep -q '^\[listener\]$' "$file" 2>/dev/null; then
+echo "server"; return
+fi
+if grep -q '^\[dialer\]$' "$file" 2>/dev/null; then
+echo "client"; return
+fi
+toml_get "$file" "ipx" "mode"
+}
+tunnel_is_tun() { grep -q '^\[tun\]$' "$1" 2>/dev/null; }
+tunnel_is_ipx() { grep -q '^\[ipx\]$' "$1" 2>/dev/null; }
+tunnel_port_number() {
+local file="$1" role="$2" addr
+if [[ "$role" == "server" ]]; then
+addr=$(toml_get "$file" "listener" "bind_addr")
+else
+addr=$(toml_get "$file" "dialer" "remote_addr")
+fi
+if [[ -z "$addr" ]]; then
+toml_get "$file" "tun" "health_port"
 return
 fi
-colorize yellow "Testing TUN connectivity to ${remote_ip} ..."
-sleep 3
-if ping -c 3 -W 2 "$remote_ip" &> /dev/null; then
-colorize green "✔ TUN link is up — ${remote_ip} is reachable."
+echo "${addr##*:}"
+}
+tunnel_peer_ip() {
+local file="$1" config_name="$2" ip
+ip=$(read_tunnel_meta "$config_name" "peer_ip")
+[[ -z "$ip" ]] && ip=$(toml_get "$file" "ipx" "dst_ip")
+echo "$ip"
+}
+tunnel_peer_ssh_port() {
+local p
+p=$(read_tunnel_meta "$1" "peer_ssh_port")
+echo "${p:-22}"
+}
+tcp_port_open() {
+local host="$1" port="$2" timeout="${3:-3}"
+timeout "$timeout" bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null
+}
+ping_stats() {
+local host="$1" count="${2:-5}"
+if ! command -v ping &> /dev/null; then
+echo "NA NA"; return 1
+fi
+local out
+out=$(ping -c "$count" -W 2 "$host" 2>/dev/null)
+if [[ -z "$out" ]]; then
+echo "NA NA"; return 1
+fi
+local avg loss
+avg=$(echo "$out" | grep -oP '(?<= = )[0-9.]+/[0-9.]+/[0-9.]+/[0-9.]+(?= ms)' | awk -F/ '{print $2}')
+loss=$(echo "$out" | grep -oP '[0-9]+(?=% packet loss)')
+echo "${avg:-NA} ${loss:-NA}"
+}
+tun_iface_exists() {
+ip link show "$1" &>/dev/null
+}
+local_role_ready() {
+local config_path="$1" is_tun="$2" tun_name="$3" config_name service_name
+config_name=$(basename "${config_path%.toml}")
+service_name="backhaul-${config_name}.service"
+if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
+ROLE_READY=0; ROLE_REASON="سرویس ${service_name} فعال نیست"
+return
+fi
+if [[ "$is_tun" == "true" ]] && ! tun_iface_exists "$tun_name"; then
+ROLE_READY=0; ROLE_REASON="اینترفیس TUN (${tun_name}) هنوز بالا نیامده"
+return
+fi
+ROLE_READY=1; ROLE_REASON="آماده"
+}
+run_tunnel_diagnostics() {
+local config_path="$1"
+if [[ ! -f "$config_path" ]]; then
+colorize red "کانفیگ یافت نشد."; press_key; return 1
+fi
+local config_name role is_tun is_ipx tun_name port peer_ip ssh_port my_label peer_label
+config_name=$(basename "${config_path%.toml}")
+role=$(tunnel_role "$config_path")
+is_tun="false"; tunnel_is_tun "$config_path" && is_tun="true"
+is_ipx="false"; tunnel_is_ipx "$config_path" && is_ipx="true"
+tun_name=$(toml_tun_name "$config_path")
+port=$(tunnel_port_number "$config_path" "$role")
+peer_ip=$(tunnel_peer_ip "$config_path" "$config_name")
+ssh_port=$(tunnel_peer_ssh_port "$config_name")
+if [[ "$role" == "server" ]]; then my_label="ایران"; peer_label="خارج"; else my_label="خارج"; peer_label="ایران"; fi
+
+clear
+colorize cyan "تشخیص وضعیت تانل: ${config_name}" bold
+echo ""
+colorize blue "── سمت ${my_label} (این سرور) ──" bold
+local_role_ready "$config_path" "$is_tun" "$tun_name"
+if [[ "$ROLE_READY" == "1" ]]; then
+colorize green "✔ سمت ${my_label} آماده است"
 else
-colorize red "✘ Could not reach ${remote_ip} over the TUN link yet."
-colorize yellow "This can be normal if the other side isn't up yet. Check logs with: journalctl -eu ${service_name} -f"
+colorize red "✘ سمت ${my_label} آماده نیست — ${ROLE_REASON}"
 fi
 echo ""
+
+local avg="NA" loss="NA"
+if [[ -z "$peer_ip" ]]; then
+colorize yellow "IP سمت مقابل ثبت نشده. از منوی ویرایش تانل، IP سمت مقابل رو وارد کنید تا دیاگ کامل (SSH/پورت/Latency/Loss) انجام بشه."
+echo ""
+else
+colorize blue "── سمت ${peer_label} (${peer_ip}) ──" bold
+read -r avg loss <<< "$(ping_stats "$peer_ip" 5)"
+if [[ "$avg" == "NA" ]]; then
+colorize red "✘ سمت ${peer_label} در دسترس نیست (ping ناموفق)"
+else
+colorize green "✔ Reachability: OK"
+echo "  Latency: ${avg} ms"
+echo "  Packet loss: ${loss}%"
+fi
+if tcp_port_open "$peer_ip" "$ssh_port" 3; then
+colorize green "✔ SSH port (${ssh_port}) باز است"
+else
+colorize red "✘ SSH port (${ssh_port}) بسته یا فیلتر شده"
+fi
+if [[ "$is_ipx" != "true" && -n "$port" ]]; then
+if tcp_port_open "$peer_ip" "$port" 3; then
+colorize green "✔ پورت تانل (${port}) از این سمت باز است"
+else
+colorize yellow "پورت تانل (${port}) پاسخ نداد (طبیعیه اگه اون سمت فقط listener سمت دیگه‌ست)"
+fi
+fi
+echo ""
+fi
+
+if [[ "$ROLE_READY" != "1" ]]; then
+colorize red "نتیجه نهایی: سمت ${my_label} آماده نیست."
+press_key
+return 1
+fi
+if [[ -z "$peer_ip" || "$avg" == "NA" ]]; then
+colorize red "نتیجه نهایی: سمت ${peer_label} آماده نیست یا در دسترس نیست."
+press_key
+return 1
+fi
+
+colorize blue "── تست نهایی End-to-End ──" bold
+local result="fail"
+if [[ "$is_tun" == "true" ]]; then
+local tun_remote
+tun_remote=$(toml_get "$config_path" "tun" "remote_addr")
+tun_remote="${tun_remote%/*}"
+if command -v ping &> /dev/null && ping -c 3 -W 2 "$tun_remote" &> /dev/null; then
+colorize green "✔ تانل برقراره — ${tun_remote} از طریق تانل قابل دسترسیه"
+result="ok"
+else
+colorize red "✘ سرویس‌ها بالان ولی هنوز از طریق تانل جواب نمی‌ده."
+colorize yellow "چک کنید سمت مقابل هم دقیقاً با همین تنظیمات (نام تانل، ساب‌نت) کانفیگ شده باشه."
+fi
+else
+colorize green "✔ هر دو سمت در دسترسن و سرویس‌ها فعالن."
+colorize yellow "برای این نوع انتقال، اتصال واقعی وقتی داده رد بشه برقرار می‌شه؛ وضعیت سرویس رو هم از منوی مدیریت تانل چک کنید."
+result="ok"
+fi
+write_tunnel_last_test "$config_name" "$result"
+echo ""
+press_key
 }
 install_jq() {
 if ! command -v jq &> /dev/null; then
@@ -404,6 +592,15 @@ read -r CONFIG[edge_ip]
 fi
 CONFIG[dial_timeout]="10"
 CONFIG[retry_interval]="3"
+fi
+local default_peer_ip=""
+if [[ "$mode" == "client" ]]; then
+default_peer_ip="${CONFIG[remote_addr]%%:*}"
+[[ "$default_peer_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || default_peer_ip=""
+fi
+prompt_with_default "Peer Server IP (other side, optional, enables cross-server diagnostics)" "$default_peer_ip" CONFIG[peer_ip]
+if [[ -n "${CONFIG[peer_ip]}" ]]; then
+prompt_with_default "Peer SSH Port (for diagnostics)" "22" CONFIG[peer_ssh_port]
 fi
 echo ""
 }
@@ -884,13 +1081,15 @@ if [[ "$is_ipx" == "true" ]]; then
 allow_ipx_protocol_firewall "${CONFIG[ipx_profile]}"
 fi
 create_systemd_service "$service_type" "$tunnel_port" "$config_file"
-if [[ "$is_tun" == "true" ]]; then
-test_tun_connectivity "${CONFIG[tun_remote_addr]}" "backhaul-${service_type}${tunnel_port}.service"
-fi
+local config_name
+config_name=$(basename "${config_file%.toml}")
+local peer_ip_for_meta="${CONFIG[peer_ip]}"
+[[ -z "$peer_ip_for_meta" && "$is_ipx" == "true" ]] && peer_ip_for_meta="${CONFIG[ipx_dst_ip]}"
+write_tunnel_meta "$config_name" "$peer_ip_for_meta" "${CONFIG[peer_ssh_port]}"
 echo ""
 colorize green "✔ Configuration completed successfully!" bold
 echo ""
-press_key
+run_tunnel_diagnostics "$config_file"
 }
 create_systemd_service() {
 local type="$1"
@@ -1080,25 +1279,483 @@ read -r choice
 [[ "$choice" == "0" ]] && return
 done
 selected_config="${configs[$((choice - 1))]}"
-config_name=$(basename "${selected_config%.toml}")
+tunnel_detail_page "$selected_config"
+}
+load_toml_ports_mapping() {
+awk '
+/^mapping = \[/ { inarr=1; next }
+inarr && /^\]/ { inarr=0 }
+inarr {
+line=$0
+gsub(/^[ \t]+|[ \t]*,?[ \t]*$/, "", line)
+gsub(/^"|"$/, "", line)
+if (length(line) > 0) printf "%s,", line
+}
+' "$1" 2>/dev/null | sed 's/,$//'
+}
+load_toml_into_config() {
+local file="$1"
+reset_config
+CONFIG[bind_addr]=$(toml_get "$file" "listener" "bind_addr")
+CONFIG[remote_addr]=$(toml_get "$file" "dialer" "remote_addr")
+CONFIG[edge_ip]=$(toml_get "$file" "dialer" "edge_ip")
+CONFIG[transport_type]=$(toml_get "$file" "transport" "type")
+CONFIG[accept_udp]=$(toml_get "$file" "transport" "accept_udp")
+CONFIG[proxy_protocol]=$(toml_get "$file" "transport" "proxy_protocol")
+CONFIG[connection_pool]=$(toml_get "$file" "transport" "connection_pool")
+CONFIG[tun_encapsulation]=$(toml_get "$file" "tun" "encapsulation")
+CONFIG[tun_name]=$(toml_get "$file" "tun" "name")
+CONFIG[tun_local_addr]=$(toml_get "$file" "tun" "local_addr")
+CONFIG[tun_remote_addr]=$(toml_get "$file" "tun" "remote_addr")
+CONFIG[tun_health_port]=$(toml_get "$file" "tun" "health_port")
+CONFIG[ipx_mode]=$(toml_get "$file" "ipx" "mode")
+CONFIG[ipx_profile]=$(toml_get "$file" "ipx" "profile")
+CONFIG[ipx_listen_ip]=$(toml_get "$file" "ipx" "listen_ip")
+CONFIG[ipx_dst_ip]=$(toml_get "$file" "ipx" "dst_ip")
+CONFIG[ipx_interface]=$(toml_get "$file" "ipx" "interface")
+CONFIG[ipx_icmp_type]=$(toml_get "$file" "ipx" "icmp_type")
+CONFIG[ipx_icmp_code]=$(toml_get "$file" "ipx" "icmp_code")
+CONFIG[mux_version]=$(toml_get "$file" "mux" "mux_version")
+CONFIG[mux_concurrency]=$(toml_get "$file" "mux" "mux_concurrency")
+CONFIG[enable_encryption]=$(toml_get "$file" "security" "enable_encryption")
+CONFIG[algorithm]=$(toml_get "$file" "security" "algorithm")
+CONFIG[psk]=$(toml_get "$file" "security" "psk")
+CONFIG[kdf_iterations]=$(toml_get "$file" "security" "kdf_iterations")
+CONFIG[token]=$(toml_get "$file" "security" "token")
+CONFIG[tls_sni]=$(toml_get "$file" "tls" "sni")
+CONFIG[tls_cert]=$(toml_get "$file" "tls" "tls_cert")
+CONFIG[tls_key]=$(toml_get "$file" "tls" "tls_key")
+CONFIG[auto_tuning]=$(toml_get "$file" "tuning" "auto_tuning")
+CONFIG[tuning_profile]=$(toml_get "$file" "tuning" "tuning_profile")
+CONFIG[workers]=$(toml_get "$file" "tuning" "workers")
+CONFIG[log_level]=$(toml_get "$file" "logging" "log_level")
+CONFIG[forwarder]=$(toml_get "$file" "ports" "forwarder")
+CONFIG[ports_mapping]=$(load_toml_ports_mapping "$file")
+local config_name
+config_name=$(basename "${file%.toml}")
+CONFIG[peer_ip]=$(tunnel_peer_ip "$file" "$config_name")
+CONFIG[peer_ssh_port]=$(tunnel_peer_ssh_port "$config_name")
+}
+backup_tunnel() {
+local config_path="$1" service_path="$2" config_name="$3" ts backup_dir
+ts=$(date +%Y%m%d%H%M%S)
+backup_dir="${config_dir}/.backups/${config_name}.${ts}"
+mkdir -p "$backup_dir"
+[[ -f "$config_path" ]] && cp -p "$config_path" "$backup_dir/config.toml"
+[[ -f "$service_path" ]] && cp -p "$service_path" "$backup_dir/service.service"
+echo "$backup_dir"
+}
+restore_tunnel_backup() {
+local backup_dir="$1" config_path="$2" service_path="$3" service_name="$4"
+[[ -f "$backup_dir/config.toml" ]] && cp -p "$backup_dir/config.toml" "$config_path"
+[[ -f "$backup_dir/service.service" ]] && cp -p "$backup_dir/service.service" "$service_path"
+systemctl daemon-reload
+systemctl restart "$service_name" 2>/dev/null
+}
+toggle_tunnel_enabled() {
+local service_name="$1"
+if systemctl is-active --quiet "$service_name"; then
+systemctl disable --now "$service_name" >/dev/null 2>&1
+colorize yellow "تانل غیرفعال شد."
+else
+systemctl enable --now "$service_name" >/dev/null 2>&1
+sleep 1
+if systemctl is-active --quiet "$service_name"; then
+colorize green "تانل فعال شد."
+else
+colorize red "فعال‌سازی ناموفق بود؛ لاگ رو چک کنید: journalctl -eu ${service_name}"
+fi
+fi
+press_key
+}
+apply_ports_mapping() {
+local config_path="$1" service_name="$2" new_mapping="$3" service_path config_name backup_dir
+service_path="${service_dir}/${service_name}"
+config_name=$(basename "${config_path%.toml}")
+backup_dir=$(backup_tunnel "$config_path" "$service_path" "$config_name")
+awk -v newmap="$new_mapping" '
+BEGIN { n = split(newmap, arr, ",") }
+/^mapping = \[/ {
+print
+for (i=1;i<=n;i++) { if (length(arr[i])>0) printf "    \"%s\",\n", arr[i] }
+inarr=1; next
+}
+inarr && /^\]/ { print; inarr=0; next }
+inarr { next }
+{ print }
+' "$config_path" > "${config_path}.new" && mv "${config_path}.new" "$config_path"
+systemctl restart "$service_name"
+sleep 2
+if systemctl is-active --quiet "$service_name"; then
+colorize green "✔ پورت‌ها بروزرسانی و سرویس Restart شد."
+rm -rf "$backup_dir"
+else
+colorize red "✘ سرویس بعد از تغییر بالا نیومد؛ در حال Rollback..."
+restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
+if systemctl is-active --quiet "$service_name"; then
+colorize green "✔ Rollback موفق بود."
+else
+colorize red "✘ Rollback هم شکست خورد! لاگ رو دستی چک کنید: journalctl -eu ${service_name}"
+fi
+fi
+press_key
+}
+edit_tunnel_ports() {
+local config_path="$1" mode="$2" config_name service_name
+if [[ "$mode" != "server" ]]; then
+colorize red "این بخش فقط برای سمت ایران (سرور) در دسترسه."
+press_key
+return
+fi
+config_name=$(basename "${config_path%.toml}")
 service_name="backhaul-${config_name}.service"
+while true; do
 clear
-colorize cyan "Manage $config_name:" bold
-echo
-colorize red "1) Remove this tunnel"
-colorize yellow "2) Restart this tunnel"
-echo "3) View service logs"
-echo "4) View service status"
-echo
-read -r -p "Enter your choice (0 to return): " choice
-case $choice in
-1) destroy_tunnel "$selected_config" ;;
-2) restart_service "$service_name" ;;
-3) view_service_logs "$service_name" ;;
-4) view_service_status "$service_name" ;;
+colorize cyan "مدیریت پورت‌های Forward — ${config_name}" bold
+echo ""
+local current
+current=$(load_toml_ports_mapping "$config_path")
+local -a ports_arr=()
+IFS=',' read -r -a ports_arr <<< "$current"
+local i=1 p
+for p in "${ports_arr[@]}"; do
+[[ -n "$p" ]] && echo "  $i) $p" && ((i++))
+done
+[[ "$i" == "1" ]] && colorize yellow "  (هیچ پورتی ثبت نشده)"
+echo ""
+colorize green "a) اضافه کردن پورت جدید"
+colorize red "d) حذف یک پورت"
+colorize yellow "e) ویرایش یک پورت"
+echo "0) بازگشت"
+read -r -p "انتخاب: " choice
+case "$choice" in
+a)
+echo -ne "پورت جدید (مثلا 443 یا 443=5000): "
+read -r new_port
+if [[ -n "$new_port" ]]; then
+current="${current:+$current,}${new_port}"
+apply_ports_mapping "$config_path" "$service_name" "$current"
+fi
+;;
+d)
+read -r -p "شماره ردیف برای حذف: " idx
+if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx < i )); then
+unset 'ports_arr[idx-1]'
+current=$(IFS=,; echo "${ports_arr[*]}")
+apply_ports_mapping "$config_path" "$service_name" "$current"
+else
+colorize red "نامعتبر"; sleep 1
+fi
+;;
+e)
+read -r -p "شماره ردیف برای ویرایش: " idx
+if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx < i )); then
+echo -ne "مقدار جدید: "
+read -r new_val
+ports_arr[idx-1]="$new_val"
+current=$(IFS=,; echo "${ports_arr[*]}")
+apply_ports_mapping "$config_path" "$service_name" "$current"
+else
+colorize red "نامعتبر"; sleep 1
+fi
+;;
 0) return ;;
-*) colorize red "Invalid option!" && sleep 1 ;;
+*) colorize red "نامعتبر"; sleep 1 ;;
 esac
+done
+}
+edit_tunnel_full() {
+local config_path="$1" mode="$2"
+local config_name service_name service_path
+config_name=$(basename "${config_path%.toml}")
+service_name="backhaul-${config_name}.service"
+service_path="${service_dir}/${service_name}"
+local backup_dir
+backup_dir=$(backup_tunnel "$config_path" "$service_path" "$config_name")
+colorize green "کانفیگ فعلی ذخیره شد: $backup_dir"
+mv "$config_path" "${config_path}.editing"
+load_toml_into_config "${backup_dir}/config.toml"
+clear
+colorize cyan "ویرایش تانل: ${config_name}" bold
+echo ""
+prompt_transport_section "$mode"
+local is_tun="false" is_ipx="false"
+[[ "${CONFIG[transport_type]}" == "tun" ]] && is_tun="true"
+[[ "${CONFIG[tun_encapsulation]}" == "ipx" ]] && is_ipx="true"
+prompt_tun_section "${CONFIG[transport_type]}" "$mode" "$is_ipx"
+prompt_ipx_section "$is_ipx" "$mode"
+if [[ "$is_ipx" != "true" ]]; then
+prompt_connection_section "$mode"
+fi
+prompt_security_section "$is_ipx"
+prompt_accept_udp_section "${CONFIG[accept_udp]}"
+prompt_mux_section "${CONFIG[transport_type]}"
+prompt_tls_section "$mode" "${CONFIG[transport_type]}"
+prompt_tuning_section "$is_ipx" "$is_tun"
+prompt_logging_section
+prompt_ports_section "$mode" "$is_tun"
+rm -f "${config_path}.editing"
+local new_port
+if [[ "$mode" == "server" ]]; then
+new_port=$(echo "${CONFIG[bind_addr]}" | grep -oP ':\K[0-9]+$')
+else
+new_port=$(echo "${CONFIG[remote_addr]}" | grep -oP ':\K[0-9]+$')
+fi
+[[ -z "$new_port" ]] && new_port="${CONFIG[tun_health_port]}"
+local prefix new_config_name new_config_path new_service_name
+[[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
+new_config_name="${prefix}${new_port}"
+new_config_path="${config_dir}/${new_config_name}.toml"
+new_service_name="backhaul-${new_config_name}.service"
+generate_toml_config "$mode" "$new_config_path" "$is_tun" "$is_ipx"
+if [[ "$new_config_name" != "$config_name" ]]; then
+colorize yellow "پورت تغییر کرد؛ سرویس قبلی حذف و سرویس جدید ساخته می‌شه..."
+systemctl disable --now "$service_name" >/dev/null 2>&1
+rm -f "$service_path"
+systemctl daemon-reload
+fi
+if [[ "$is_tun" == "true" ]]; then
+prepare_tun_ipx_kernel "$is_ipx" "${CONFIG[ipx_profile]}" "${CONFIG[tun_name]}"
+fi
+if [[ "$is_ipx" == "true" ]]; then
+allow_ipx_protocol_firewall "${CONFIG[ipx_profile]}"
+fi
+local peer_ip_for_meta="${CONFIG[peer_ip]}"
+[[ -z "$peer_ip_for_meta" && "$is_ipx" == "true" ]] && peer_ip_for_meta="${CONFIG[ipx_dst_ip]}"
+write_tunnel_meta "$new_config_name" "$peer_ip_for_meta" "${CONFIG[peer_ssh_port]}"
+create_systemd_service "$prefix" "$new_port" "$new_config_path"
+systemctl restart "$new_service_name"
+sleep 2
+if systemctl is-active --quiet "$new_service_name"; then
+colorize green "✔ سرویس با موفقیت اعمال شد و سالمه."
+rm -rf "$backup_dir"
+else
+colorize red "✘ سرویس بعد از تغییرات بالا نیومد! در حال Rollback..."
+systemctl disable --now "$new_service_name" >/dev/null 2>&1
+rm -f "$new_config_path" "${service_dir}/${new_service_name}"
+systemctl daemon-reload
+restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
+if systemctl is-active --quiet "$service_name"; then
+colorize green "✔ Rollback موفق بود، تانل به حالت قبل برگشت."
+else
+colorize red "✘ Rollback هم شکست خورد! لاگ رو دستی چک کنید: journalctl -eu ${service_name}"
+fi
+press_key
+return 1
+fi
+echo ""
+run_tunnel_diagnostics "$new_config_path"
+}
+edit_tunnel() {
+local config_path="$1" config_name service_name role mode
+config_name=$(basename "${config_path%.toml}")
+service_name="backhaul-${config_name}.service"
+role=$(tunnel_role "$config_path")
+[[ "$role" == "server" ]] && mode="server" || mode="client"
+clear
+colorize cyan "ویرایش تانل: ${config_name}" bold
+echo ""
+colorize yellow "1) ویرایش کامل تنظیمات (IP/پورت/نوع تانل/...)"
+[[ "$role" == "server" ]] && colorize yellow "2) مدیریت پورت‌های Forward شده"
+colorize yellow "3) فعال/غیرفعال کردن تانل"
+echo "0) بازگشت"
+read -r -p "انتخاب: " choice
+case "$choice" in
+1) edit_tunnel_full "$config_path" "$mode" ;;
+2) [[ "$role" == "server" ]] && edit_tunnel_ports "$config_path" "$mode" ;;
+3) toggle_tunnel_enabled "$service_name" ;;
+0) return ;;
+*) colorize red "نامعتبر"; sleep 1 ;;
+esac
+}
+benchmark_tcp_probe() {
+local peer_ip="$1" port="$2" start end elapsed success=0 i
+local latencies=()
+for i in 1 2 3 4 5; do
+start=$(date +%s%N)
+if tcp_port_open "$peer_ip" "$port" 2; then
+end=$(date +%s%N)
+elapsed=$(( (end-start)/1000000 ))
+latencies+=("$elapsed")
+success=$((success+1))
+fi
+done
+local n=${#latencies[@]}
+if (( n == 0 )); then
+echo "NA NA NA"
+return
+fi
+local sum=0 l
+for l in "${latencies[@]}"; do sum=$((sum+l)); done
+local avg=$((sum/n))
+local loss=$(( (5-success)*100/5 ))
+local throughput="NA"
+if command -v iperf3 &> /dev/null; then
+local iperf_out
+iperf_out=$(timeout 6 iperf3 -c "$peer_ip" -p 5201 -t 3 -J 2>/dev/null)
+if [[ -n "$iperf_out" ]]; then
+throughput=$(echo "$iperf_out" | grep -oP '"bits_per_second":\s*\K[0-9.]+' | tail -1)
+[[ -n "$throughput" ]] && throughput=$(awk -v b="$throughput" 'BEGIN{printf "%.0f", b/1000000}')
+fi
+fi
+echo "$avg $loss ${throughput:-NA}"
+}
+benchmark_icmp_probe() {
+local peer_ip="$1" avg loss
+read -r avg loss <<< "$(ping_stats "$peer_ip" 10)"
+echo "$avg $loss NA"
+}
+benchmark_raw_protocol_probe() {
+local peer_ip="$1" proto_num="$2"
+if ! command -v hping3 &> /dev/null; then
+echo "UNSUPPORTED"
+return
+fi
+if timeout 5 hping3 -c 3 --rawip -H "$proto_num" "$peer_ip" 2>/dev/null | grep -q "bytes from"; then
+echo "OK"
+else
+echo "BLOCKED"
+fi
+}
+score_result() {
+local latency="$1" loss="$2"
+if [[ "$latency" == "NA" ]]; then echo 999999; return; fi
+echo $(( latency + loss*20 ))
+}
+status_label() {
+local latency="$1" loss="$2"
+if [[ "$latency" == "NA" ]]; then echo "غیرقابل استفاده"; return; fi
+if (( loss == 0 && latency < 80 )); then echo "عالی"
+elif (( loss <= 2 && latency < 150 )); then echo "خوب"
+elif (( loss <= 5 && latency < 300 )); then echo "متوسط"
+else echo "ضعیف"
+fi
+}
+benchmark_tunnel_protocols() {
+local config_path="$1" config_name peer_ip port
+config_name=$(basename "${config_path%.toml}")
+peer_ip=$(tunnel_peer_ip "$config_path" "$config_name")
+if [[ -z "$peer_ip" ]]; then
+colorize red "IP سمت مقابل ثبت نشده — اول از منوی ویرایش، IP سمت مقابل رو وارد کنید."
+press_key
+return 1
+fi
+port=$(tunnel_port_number "$config_path" "$(tunnel_role "$config_path")")
+[[ -z "$port" ]] && port=$(tunnel_peer_ssh_port "$config_name")
+
+clear
+colorize cyan "Benchmark پروتکل‌ها — مقصد: ${peer_ip}" bold
+colorize yellow "توجه: throughput واقعی نیازمند iperf3 روی سمت مقابل (iperf3 -s) هست، وگرنه N/A نشون داده می‌شه. تست GRE/IPIP فقط 'قابل عبور بودن پروتکل رو از فایروال بین راه' می‌سنجه (نیاز به hping3)، نه بنچمارک یک تانل واقعی زنده چون برای اون به کانفیگ هم‌زمان سمت مقابل نیاز است."
+echo ""
+
+local -A RESULTS
+colorize yellow "در حال تست TCP..."
+RESULTS[tcp]=$(benchmark_tcp_probe "$peer_ip" "$port")
+colorize yellow "در حال تست ICMP..."
+RESULTS[icmp]=$(benchmark_icmp_probe "$peer_ip")
+colorize yellow "در حال تست GRE (قابلیت عبور پروتکل)..."
+RESULTS[gre]=$(benchmark_raw_protocol_probe "$peer_ip" 47)
+colorize yellow "در حال تست IPIP (قابلیت عبور پروتکل)..."
+RESULTS[ipip]=$(benchmark_raw_protocol_probe "$peer_ip" 4)
+
+echo ""
+colorize cyan "نتیجه تست:" bold
+echo ""
+local best_key="" best_score=999999999 i=1 key label lat loss thr status score
+for key in tcp icmp; do
+IFS=' ' read -r lat loss thr <<< "${RESULTS[$key]}"
+[[ "$key" == "tcp" ]] && label="TCP Tunnel" || label="ICMP Tunnel"
+status=$(status_label "$lat" "$loss")
+score=$(score_result "$lat" "$loss")
+echo "$i. $label"
+if [[ "$lat" == "NA" ]]; then
+echo "   در دسترس نیست"
+else
+echo "   Latency: ${lat}ms"
+echo "   Loss: ${loss}%"
+if [[ "$thr" != "NA" ]]; then
+echo "   Speed: ${thr}Mbps"
+else
+echo "   Speed: N/A (iperf3 روی سمت مقابل در دسترس نیست)"
+fi
+fi
+echo "   Status: $status"
+echo ""
+if (( score < best_score )); then best_score=$score; best_key="$label"; fi
+((i++))
+done
+for key in gre ipip; do
+[[ "$key" == "gre" ]] && label="GRE Tunnel (IPX)" || label="IPIP Tunnel (IPX)"
+echo "$i. $label"
+case "${RESULTS[$key]}" in
+OK) echo "   Status: پروتکل روی مسیر شبکه باز است (throughput/latency واقعی نیازمند برپایی تانل واقعیه)" ;;
+BLOCKED) echo "   Status: این پروتکل توسط یکی از دو سمت مسدود/فیلتر شده" ;;
+UNSUPPORTED) echo "   Status: برای تست این پروتکل، hping3 نصب نیست" ;;
+esac
+echo ""
+((i++))
+done
+
+if [[ -n "$best_key" ]]; then
+colorize green "پیشنهاد سیستم: ${best_key} بهترین انتخاب است."
+else
+colorize yellow "پیشنهاد سیستم: هیچ‌کدام از پروتکل‌های تست‌شده به‌طور قابل‌اعتماد در دسترس نبودند."
+fi
+write_tunnel_last_test "$config_name" "benchmark:${best_key:-none}"
+echo ""
+press_key
+}
+tunnel_detail_page() {
+local config_path="$1"
+local config_name service_name role transport ipx_profile peer_ip last_test last_time ports_count
+config_name=$(basename "${config_path%.toml}")
+service_name="backhaul-${config_name}.service"
+while true; do
+[[ -f "$config_path" ]] || return
+role=$(tunnel_role "$config_path")
+transport=$(toml_get "$config_path" "transport" "type")
+ipx_profile=$(toml_get "$config_path" "ipx" "profile")
+peer_ip=$(tunnel_peer_ip "$config_path" "$config_name")
+clear
+colorize cyan "تانل: ${config_name}" bold
+echo ""
+if systemctl is-active --quiet "$service_name"; then
+colorize green "وضعیت فعلی: فعال (Active)"
+else
+colorize red "وضعیت فعلی: غیرفعال (Inactive)"
+fi
+IFS='|' read -r last_test last_time <<< "$(read_tunnel_last_test "$config_name")"
+echo "آخرین تست: ${last_test} (${last_time})"
+echo "نوع تانل: ${transport}${ipx_profile:+ / ipx:$ipx_profile}"
+echo "نقش: $([[ "$role" == "server" ]] && echo "ایران (سرور)" || echo "خارج (کلاینت)")"
+if [[ -n "$peer_ip" ]]; then echo "IP سمت مقابل: ${peer_ip}"; else echo "IP سمت مقابل: ثبت نشده"; fi
+if [[ "$role" == "server" ]]; then
+ports_count=$(load_toml_ports_mapping "$config_path" | tr ',' '\n' | grep -c .)
+echo "پورت‌های Forward شده: ${ports_count:-0} مورد"
+fi
+echo ""
+colorize green "1) ویرایش تانل"
+colorize cyan "2) تست مجدد (Diagnostics)"
+colorize magenta "3) Benchmark پروتکل‌ها"
+echo "4) مشاهده لاگ سرویس"
+echo "5) مشاهده وضعیت سرویس"
+colorize yellow "6) Restart سرویس"
+colorize red "7) حذف این تانل"
+echo "0) بازگشت"
+echo ""
+read -r -p "انتخاب: " choice
+case "$choice" in
+1) edit_tunnel "$config_path" ;;
+2) run_tunnel_diagnostics "$config_path" ;;
+3) benchmark_tunnel_protocols "$config_path" ;;
+4) view_service_logs "$service_name" ;;
+5) view_service_status "$service_name" ;;
+6) restart_service "$service_name" ;;
+7) destroy_tunnel "$config_path"; return ;;
+0) return ;;
+*) colorize red "نامعتبر"; sleep 1 ;;
+esac
+done
 }
 destroy_tunnel() {
 config_path="$1"
