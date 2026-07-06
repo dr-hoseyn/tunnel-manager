@@ -327,7 +327,7 @@ echo "${result}|$(date '+%Y-%m-%d %H:%M:%S')" > "${config_dir}/.status/${config_
 read_tunnel_last_test() {
 local config_name="$1"
 local f="${config_dir}/.status/${config_name}.status"
-[[ -f "$f" ]] && cat "$f" || echo "هنوز تست نشده|-"
+[[ -f "$f" ]] && cat "$f" || echo "Never tested|-"
 }
 toml_get() {
 local file="$1" section="$2" key="$3"
@@ -409,19 +409,19 @@ local config_path="$1" is_tun="$2" tun_name="$3" config_name service_name
 config_name=$(basename "${config_path%.toml}")
 service_name="backhaul-${config_name}.service"
 if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
-ROLE_READY=0; ROLE_REASON="سرویس ${service_name} فعال نیست"
+ROLE_READY=0; ROLE_REASON="service ${service_name} is not active"
 return
 fi
 if [[ "$is_tun" == "true" ]] && ! tun_iface_exists "$tun_name"; then
-ROLE_READY=0; ROLE_REASON="اینترفیس TUN (${tun_name}) هنوز بالا نیامده"
+ROLE_READY=0; ROLE_REASON="TUN interface (${tun_name}) is not up yet"
 return
 fi
-ROLE_READY=1; ROLE_REASON="آماده"
+ROLE_READY=1; ROLE_REASON="ready"
 }
 run_tunnel_diagnostics() {
 local config_path="$1"
 if [[ ! -f "$config_path" ]]; then
-colorize red "کانفیگ یافت نشد."; press_key; return 1
+colorize red "Config not found."; press_key; return 1
 fi
 local config_name role is_tun is_ipx tun_name port peer_ip ssh_port my_label peer_label
 config_name=$(basename "${config_path%.toml}")
@@ -432,76 +432,76 @@ tun_name=$(toml_tun_name "$config_path")
 port=$(tunnel_port_number "$config_path" "$role")
 peer_ip=$(tunnel_peer_ip "$config_path" "$config_name")
 ssh_port=$(tunnel_peer_ssh_port "$config_name")
-if [[ "$role" == "server" ]]; then my_label="ایران"; peer_label="خارج"; else my_label="خارج"; peer_label="ایران"; fi
+if [[ "$role" == "server" ]]; then my_label="IRAN"; peer_label="KHAREJ"; else my_label="KHAREJ"; peer_label="IRAN"; fi
 
 clear
-colorize cyan "تشخیص وضعیت تانل: ${config_name}" bold
+colorize cyan "Tunnel Diagnostics: ${config_name}" bold
 echo ""
-colorize blue "── سمت ${my_label} (این سرور) ──" bold
+colorize blue "── ${my_label} side (this server) ──" bold
 local_role_ready "$config_path" "$is_tun" "$tun_name"
 if [[ "$ROLE_READY" == "1" ]]; then
-colorize green "✔ سمت ${my_label} آماده است"
+colorize green "✔ ${my_label} side is ready"
 else
-colorize red "✘ سمت ${my_label} آماده نیست — ${ROLE_REASON}"
+colorize red "✘ ${my_label} side is not ready — ${ROLE_REASON}"
 fi
 echo ""
 
 local avg="NA" loss="NA"
 if [[ -z "$peer_ip" ]]; then
-colorize yellow "IP سمت مقابل ثبت نشده. از منوی ویرایش تانل، IP سمت مقابل رو وارد کنید تا دیاگ کامل (SSH/پورت/Latency/Loss) انجام بشه."
+colorize yellow "Peer IP is not set. Set it from the tunnel's Edit menu to enable full diagnostics (SSH/port/latency/loss)."
 echo ""
 else
-colorize blue "── سمت ${peer_label} (${peer_ip}) ──" bold
+colorize blue "── ${peer_label} side (${peer_ip}) ──" bold
 read -r avg loss <<< "$(ping_stats "$peer_ip" 5)"
 if [[ "$avg" == "NA" ]]; then
-colorize red "✘ سمت ${peer_label} در دسترس نیست (ping ناموفق)"
+colorize red "✘ ${peer_label} side is not reachable (ping failed)"
 else
 colorize green "✔ Reachability: OK"
 echo "  Latency: ${avg} ms"
 echo "  Packet loss: ${loss}%"
 fi
 if tcp_port_open "$peer_ip" "$ssh_port" 3; then
-colorize green "✔ SSH port (${ssh_port}) باز است"
+colorize green "✔ SSH port (${ssh_port}) is open"
 else
-colorize red "✘ SSH port (${ssh_port}) بسته یا فیلتر شده"
+colorize red "✘ SSH port (${ssh_port}) is closed or filtered"
 fi
 if [[ "$is_ipx" != "true" && -n "$port" ]]; then
 if tcp_port_open "$peer_ip" "$port" 3; then
-colorize green "✔ پورت تانل (${port}) از این سمت باز است"
+colorize green "✔ Tunnel port (${port}) is open on this side"
 else
-colorize yellow "پورت تانل (${port}) پاسخ نداد (طبیعیه اگه اون سمت فقط listener سمت دیگه‌ست)"
+colorize yellow "Tunnel port (${port}) did not respond (normal if the peer only listens the other way)"
 fi
 fi
 echo ""
 fi
 
 if [[ "$ROLE_READY" != "1" ]]; then
-colorize red "نتیجه نهایی: سمت ${my_label} آماده نیست."
+colorize red "Result: ${my_label} side is not ready."
 press_key
 return 1
 fi
 if [[ -z "$peer_ip" || "$avg" == "NA" ]]; then
-colorize red "نتیجه نهایی: سمت ${peer_label} آماده نیست یا در دسترس نیست."
+colorize red "Result: ${peer_label} side is not ready or not reachable."
 press_key
 return 1
 fi
 
-colorize blue "── تست نهایی End-to-End ──" bold
+colorize blue "── Final End-to-End Test ──" bold
 local result="fail"
 if [[ "$is_tun" == "true" ]]; then
 local tun_remote
 tun_remote=$(toml_get "$config_path" "tun" "remote_addr")
 tun_remote="${tun_remote%/*}"
 if command -v ping &> /dev/null && ping -c 3 -W 2 "$tun_remote" &> /dev/null; then
-colorize green "✔ تانل برقراره — ${tun_remote} از طریق تانل قابل دسترسیه"
+colorize green "✔ Tunnel is up — ${tun_remote} is reachable through the tunnel"
 result="ok"
 else
-colorize red "✘ سرویس‌ها بالان ولی هنوز از طریق تانل جواب نمی‌ده."
-colorize yellow "چک کنید سمت مقابل هم دقیقاً با همین تنظیمات (نام تانل، ساب‌نت) کانفیگ شده باشه."
+colorize red "✘ Services are up but the tunnel isn't answering yet."
+colorize yellow "Check that the peer side is configured with matching settings (tunnel name, subnet)."
 fi
 else
-colorize green "✔ هر دو سمت در دسترسن و سرویس‌ها فعالن."
-colorize yellow "برای این نوع انتقال، اتصال واقعی وقتی داده رد بشه برقرار می‌شه؛ وضعیت سرویس رو هم از منوی مدیریت تانل چک کنید."
+colorize green "✔ Both sides are reachable and services are active."
+colorize yellow "For this transport, the real connection is established once traffic flows; check the service status from Tunnel Management too."
 result="ok"
 fi
 write_tunnel_last_test "$config_name" "$result"
@@ -1356,14 +1356,14 @@ toggle_tunnel_enabled() {
 local service_name="$1"
 if systemctl is-active --quiet "$service_name"; then
 systemctl disable --now "$service_name" >/dev/null 2>&1
-colorize yellow "تانل غیرفعال شد."
+colorize yellow "Tunnel disabled."
 else
 systemctl enable --now "$service_name" >/dev/null 2>&1
 sleep 1
 if systemctl is-active --quiet "$service_name"; then
-colorize green "تانل فعال شد."
+colorize green "Tunnel enabled."
 else
-colorize red "فعال‌سازی ناموفق بود؛ لاگ رو چک کنید: journalctl -eu ${service_name}"
+colorize red "Failed to enable. Check logs: journalctl -eu ${service_name}"
 fi
 fi
 press_key
@@ -1387,15 +1387,15 @@ inarr { next }
 systemctl restart "$service_name"
 sleep 2
 if systemctl is-active --quiet "$service_name"; then
-colorize green "✔ پورت‌ها بروزرسانی و سرویس Restart شد."
+colorize green "✔ Ports updated and service restarted."
 rm -rf "$backup_dir"
 else
-colorize red "✘ سرویس بعد از تغییر بالا نیومد؛ در حال Rollback..."
+colorize red "✘ Service failed to come back up; rolling back..."
 restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
 if systemctl is-active --quiet "$service_name"; then
-colorize green "✔ Rollback موفق بود."
+colorize green "✔ Rollback succeeded."
 else
-colorize red "✘ Rollback هم شکست خورد! لاگ رو دستی چک کنید: journalctl -eu ${service_name}"
+colorize red "✘ Rollback also failed! Check logs manually: journalctl -eu ${service_name}"
 fi
 fi
 press_key
@@ -1403,7 +1403,7 @@ press_key
 edit_tunnel_ports() {
 local config_path="$1" mode="$2" config_name service_name
 if [[ "$mode" != "server" ]]; then
-colorize red "این بخش فقط برای سمت ایران (سرور) در دسترسه."
+colorize red "This section is only available for the IRAN (server) side."
 press_key
 return
 fi
@@ -1411,7 +1411,7 @@ config_name=$(basename "${config_path%.toml}")
 service_name="backhaul-${config_name}.service"
 while true; do
 clear
-colorize cyan "مدیریت پورت‌های Forward — ${config_name}" bold
+colorize cyan "Forwarded Ports — ${config_name}" bold
 echo ""
 local current
 current=$(load_toml_ports_mapping "$config_path")
@@ -1421,16 +1421,16 @@ local i=1 p
 for p in "${ports_arr[@]}"; do
 [[ -n "$p" ]] && echo "  $i) $p" && ((i++))
 done
-[[ "$i" == "1" ]] && colorize yellow "  (هیچ پورتی ثبت نشده)"
+[[ "$i" == "1" ]] && colorize yellow "  (no ports configured)"
 echo ""
-colorize green "a) اضافه کردن پورت جدید"
-colorize red "d) حذف یک پورت"
-colorize yellow "e) ویرایش یک پورت"
-echo "0) بازگشت"
-read -r -p "انتخاب: " choice
+colorize green "a) Add a new port"
+colorize red "d) Remove a port"
+colorize yellow "e) Edit a port"
+echo "0) Back"
+read -r -p "Choice: " choice
 case "$choice" in
 a)
-echo -ne "پورت جدید (مثلا 443 یا 443=5000): "
+echo -ne "New port (e.g. 443 or 443=5000): "
 read -r new_port
 if [[ -n "$new_port" ]]; then
 current="${current:+$current,}${new_port}"
@@ -1438,29 +1438,29 @@ apply_ports_mapping "$config_path" "$service_name" "$current"
 fi
 ;;
 d)
-read -r -p "شماره ردیف برای حذف: " idx
+read -r -p "Row number to remove: " idx
 if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx < i )); then
 unset 'ports_arr[idx-1]'
 current=$(IFS=,; echo "${ports_arr[*]}")
 apply_ports_mapping "$config_path" "$service_name" "$current"
 else
-colorize red "نامعتبر"; sleep 1
+colorize red "Invalid choice"; sleep 1
 fi
 ;;
 e)
-read -r -p "شماره ردیف برای ویرایش: " idx
+read -r -p "Row number to edit: " idx
 if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx < i )); then
-echo -ne "مقدار جدید: "
+echo -ne "New value: "
 read -r new_val
 ports_arr[idx-1]="$new_val"
 current=$(IFS=,; echo "${ports_arr[*]}")
 apply_ports_mapping "$config_path" "$service_name" "$current"
 else
-colorize red "نامعتبر"; sleep 1
+colorize red "Invalid choice"; sleep 1
 fi
 ;;
 0) return ;;
-*) colorize red "نامعتبر"; sleep 1 ;;
+*) colorize red "Invalid choice"; sleep 1 ;;
 esac
 done
 }
@@ -1472,11 +1472,11 @@ service_name="backhaul-${config_name}.service"
 service_path="${service_dir}/${service_name}"
 local backup_dir
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "$config_name")
-colorize green "کانفیگ فعلی ذخیره شد: $backup_dir"
+colorize green "Current config backed up: $backup_dir"
 mv "$config_path" "${config_path}.editing"
 load_toml_into_config "${backup_dir}/config.toml"
 clear
-colorize cyan "ویرایش تانل: ${config_name}" bold
+colorize cyan "Edit Tunnel: ${config_name}" bold
 echo ""
 prompt_transport_section "$mode"
 local is_tun="false" is_ipx="false"
@@ -1509,7 +1509,7 @@ new_config_path="${config_dir}/${new_config_name}.toml"
 new_service_name="backhaul-${new_config_name}.service"
 generate_toml_config "$mode" "$new_config_path" "$is_tun" "$is_ipx"
 if [[ "$new_config_name" != "$config_name" ]]; then
-colorize yellow "پورت تغییر کرد؛ سرویس قبلی حذف و سرویس جدید ساخته می‌شه..."
+colorize yellow "Port changed; removing the old service and creating a new one..."
 systemctl disable --now "$service_name" >/dev/null 2>&1
 rm -f "$service_path"
 systemctl daemon-reload
@@ -1527,18 +1527,18 @@ create_systemd_service "$prefix" "$new_port" "$new_config_path"
 systemctl restart "$new_service_name"
 sleep 2
 if systemctl is-active --quiet "$new_service_name"; then
-colorize green "✔ سرویس با موفقیت اعمال شد و سالمه."
+colorize green "✔ Changes applied successfully; service is healthy."
 rm -rf "$backup_dir"
 else
-colorize red "✘ سرویس بعد از تغییرات بالا نیومد! در حال Rollback..."
+colorize red "✘ Service failed to come back up! Rolling back..."
 systemctl disable --now "$new_service_name" >/dev/null 2>&1
 rm -f "$new_config_path" "${service_dir}/${new_service_name}"
 systemctl daemon-reload
 restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
 if systemctl is-active --quiet "$service_name"; then
-colorize green "✔ Rollback موفق بود، تانل به حالت قبل برگشت."
+colorize green "✔ Rollback succeeded, tunnel restored to its previous state."
 else
-colorize red "✘ Rollback هم شکست خورد! لاگ رو دستی چک کنید: journalctl -eu ${service_name}"
+colorize red "✘ Rollback also failed! Check logs manually: journalctl -eu ${service_name}"
 fi
 press_key
 return 1
@@ -1553,19 +1553,19 @@ service_name="backhaul-${config_name}.service"
 role=$(tunnel_role "$config_path")
 [[ "$role" == "server" ]] && mode="server" || mode="client"
 clear
-colorize cyan "ویرایش تانل: ${config_name}" bold
+colorize cyan "Edit Tunnel: ${config_name}" bold
 echo ""
-colorize yellow "1) ویرایش کامل تنظیمات (IP/پورت/نوع تانل/...)"
-[[ "$role" == "server" ]] && colorize yellow "2) مدیریت پورت‌های Forward شده"
-colorize yellow "3) فعال/غیرفعال کردن تانل"
-echo "0) بازگشت"
-read -r -p "انتخاب: " choice
+colorize yellow "1) Full reconfiguration (IP/port/tunnel type/...)"
+[[ "$role" == "server" ]] && colorize yellow "2) Manage forwarded ports"
+colorize yellow "3) Enable/disable tunnel"
+echo "0) Back"
+read -r -p "Choice: " choice
 case "$choice" in
 1) edit_tunnel_full "$config_path" "$mode" ;;
 2) [[ "$role" == "server" ]] && edit_tunnel_ports "$config_path" "$mode" ;;
 3) toggle_tunnel_enabled "$service_name" ;;
 0) return ;;
-*) colorize red "نامعتبر"; sleep 1 ;;
+*) colorize red "Invalid choice"; sleep 1 ;;
 esac
 }
 benchmark_tcp_probe() {
@@ -1624,11 +1624,11 @@ echo $(( latency + loss*20 ))
 }
 status_label() {
 local latency="$1" loss="$2"
-if [[ "$latency" == "NA" ]]; then echo "غیرقابل استفاده"; return; fi
-if (( loss == 0 && latency < 80 )); then echo "عالی"
-elif (( loss <= 2 && latency < 150 )); then echo "خوب"
-elif (( loss <= 5 && latency < 300 )); then echo "متوسط"
-else echo "ضعیف"
+if [[ "$latency" == "NA" ]]; then echo "Unusable"; return; fi
+if (( loss == 0 && latency < 80 )); then echo "Excellent"
+elif (( loss <= 2 && latency < 150 )); then echo "Good"
+elif (( loss <= 5 && latency < 300 )); then echo "Fair"
+else echo "Poor"
 fi
 }
 benchmark_tunnel_protocols() {
@@ -1636,7 +1636,7 @@ local config_path="$1" config_name peer_ip port
 config_name=$(basename "${config_path%.toml}")
 peer_ip=$(tunnel_peer_ip "$config_path" "$config_name")
 if [[ -z "$peer_ip" ]]; then
-colorize red "IP سمت مقابل ثبت نشده — اول از منوی ویرایش، IP سمت مقابل رو وارد کنید."
+colorize red "Peer IP is not set — set it from the Edit menu first."
 press_key
 return 1
 fi
@@ -1644,22 +1644,22 @@ port=$(tunnel_port_number "$config_path" "$(tunnel_role "$config_path")")
 [[ -z "$port" ]] && port=$(tunnel_peer_ssh_port "$config_name")
 
 clear
-colorize cyan "Benchmark پروتکل‌ها — مقصد: ${peer_ip}" bold
-colorize yellow "توجه: throughput واقعی نیازمند iperf3 روی سمت مقابل (iperf3 -s) هست، وگرنه N/A نشون داده می‌شه. تست GRE/IPIP فقط 'قابل عبور بودن پروتکل رو از فایروال بین راه' می‌سنجه (نیاز به hping3)، نه بنچمارک یک تانل واقعی زنده چون برای اون به کانفیگ هم‌زمان سمت مقابل نیاز است."
+colorize cyan "Protocol Benchmark — target: ${peer_ip}" bold
+colorize yellow "Note: real throughput needs iperf3 running on the peer (iperf3 -s), otherwise it shows N/A. The GRE/IPIP test only checks whether the protocol passes through firewalls on the path (needs hping3) — it is not a live tunnel benchmark, since that needs matching config on both sides at once."
 echo ""
 
 local -A RESULTS
-colorize yellow "در حال تست TCP..."
+colorize yellow "Testing TCP..."
 RESULTS[tcp]=$(benchmark_tcp_probe "$peer_ip" "$port")
-colorize yellow "در حال تست ICMP..."
+colorize yellow "Testing ICMP..."
 RESULTS[icmp]=$(benchmark_icmp_probe "$peer_ip")
-colorize yellow "در حال تست GRE (قابلیت عبور پروتکل)..."
+colorize yellow "Testing GRE (protocol reachability)..."
 RESULTS[gre]=$(benchmark_raw_protocol_probe "$peer_ip" 47)
-colorize yellow "در حال تست IPIP (قابلیت عبور پروتکل)..."
+colorize yellow "Testing IPIP (protocol reachability)..."
 RESULTS[ipip]=$(benchmark_raw_protocol_probe "$peer_ip" 4)
 
 echo ""
-colorize cyan "نتیجه تست:" bold
+colorize cyan "Test results:" bold
 echo ""
 local best_key="" best_score=999999999 i=1 key label lat loss thr status score
 for key in tcp icmp; do
@@ -1669,14 +1669,14 @@ status=$(status_label "$lat" "$loss")
 score=$(score_result "$lat" "$loss")
 echo "$i. $label"
 if [[ "$lat" == "NA" ]]; then
-echo "   در دسترس نیست"
+echo "   Not reachable"
 else
 echo "   Latency: ${lat}ms"
 echo "   Loss: ${loss}%"
 if [[ "$thr" != "NA" ]]; then
 echo "   Speed: ${thr}Mbps"
 else
-echo "   Speed: N/A (iperf3 روی سمت مقابل در دسترس نیست)"
+echo "   Speed: N/A (iperf3 not available on the peer)"
 fi
 fi
 echo "   Status: $status"
@@ -1688,18 +1688,18 @@ for key in gre ipip; do
 [[ "$key" == "gre" ]] && label="GRE Tunnel (IPX)" || label="IPIP Tunnel (IPX)"
 echo "$i. $label"
 case "${RESULTS[$key]}" in
-OK) echo "   Status: پروتکل روی مسیر شبکه باز است (throughput/latency واقعی نیازمند برپایی تانل واقعیه)" ;;
-BLOCKED) echo "   Status: این پروتکل توسط یکی از دو سمت مسدود/فیلتر شده" ;;
-UNSUPPORTED) echo "   Status: برای تست این پروتکل، hping3 نصب نیست" ;;
+OK) echo "   Status: protocol passes through the network path (real throughput/latency needs a live tunnel)" ;;
+BLOCKED) echo "   Status: this protocol is blocked/filtered on one of the two sides" ;;
+UNSUPPORTED) echo "   Status: hping3 is not installed, cannot test this protocol" ;;
 esac
 echo ""
 ((i++))
 done
 
 if [[ -n "$best_key" ]]; then
-colorize green "پیشنهاد سیستم: ${best_key} بهترین انتخاب است."
+colorize green "Recommendation: ${best_key} is the best choice."
 else
-colorize yellow "پیشنهاد سیستم: هیچ‌کدام از پروتکل‌های تست‌شده به‌طور قابل‌اعتماد در دسترس نبودند."
+colorize yellow "Recommendation: none of the tested protocols were reliably reachable."
 fi
 write_tunnel_last_test "$config_name" "benchmark:${best_key:-none}"
 echo ""
@@ -1717,33 +1717,33 @@ transport=$(toml_get "$config_path" "transport" "type")
 ipx_profile=$(toml_get "$config_path" "ipx" "profile")
 peer_ip=$(tunnel_peer_ip "$config_path" "$config_name")
 clear
-colorize cyan "تانل: ${config_name}" bold
+colorize cyan "Tunnel: ${config_name}" bold
 echo ""
 if systemctl is-active --quiet "$service_name"; then
-colorize green "وضعیت فعلی: فعال (Active)"
+colorize green "Status: Active"
 else
-colorize red "وضعیت فعلی: غیرفعال (Inactive)"
+colorize red "Status: Inactive"
 fi
 IFS='|' read -r last_test last_time <<< "$(read_tunnel_last_test "$config_name")"
-echo "آخرین تست: ${last_test} (${last_time})"
-echo "نوع تانل: ${transport}${ipx_profile:+ / ipx:$ipx_profile}"
-echo "نقش: $([[ "$role" == "server" ]] && echo "ایران (سرور)" || echo "خارج (کلاینت)")"
-if [[ -n "$peer_ip" ]]; then echo "IP سمت مقابل: ${peer_ip}"; else echo "IP سمت مقابل: ثبت نشده"; fi
+echo "Last test: ${last_test} (${last_time})"
+echo "Tunnel type: ${transport}${ipx_profile:+ / ipx:$ipx_profile}"
+echo "Role: $([[ "$role" == "server" ]] && echo "IRAN (Server)" || echo "KHAREJ (Client)")"
+if [[ -n "$peer_ip" ]]; then echo "Peer IP: ${peer_ip}"; else echo "Peer IP: not set"; fi
 if [[ "$role" == "server" ]]; then
 ports_count=$(load_toml_ports_mapping "$config_path" | tr ',' '\n' | grep -c .)
-echo "پورت‌های Forward شده: ${ports_count:-0} مورد"
+echo "Forwarded ports: ${ports_count:-0}"
 fi
 echo ""
-colorize green "1) ویرایش تانل"
-colorize cyan "2) تست مجدد (Diagnostics)"
-colorize magenta "3) Benchmark پروتکل‌ها"
-echo "4) مشاهده لاگ سرویس"
-echo "5) مشاهده وضعیت سرویس"
-colorize yellow "6) Restart سرویس"
-colorize red "7) حذف این تانل"
-echo "0) بازگشت"
+colorize green "1) Edit tunnel"
+colorize cyan "2) Retest (Diagnostics)"
+colorize magenta "3) Benchmark protocols"
+echo "4) View service logs"
+echo "5) View service status"
+colorize yellow "6) Restart service"
+colorize red "7) Remove this tunnel"
+echo "0) Back"
 echo ""
-read -r -p "انتخاب: " choice
+read -r -p "Choice: " choice
 case "$choice" in
 1) edit_tunnel "$config_path" ;;
 2) run_tunnel_diagnostics "$config_path" ;;
@@ -1753,7 +1753,7 @@ case "$choice" in
 6) restart_service "$service_name" ;;
 7) destroy_tunnel "$config_path"; return ;;
 0) return ;;
-*) colorize red "نامعتبر"; sleep 1 ;;
+*) colorize red "Invalid choice"; sleep 1 ;;
 esac
 done
 }
