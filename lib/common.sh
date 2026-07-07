@@ -215,6 +215,26 @@ rm -f "$FAIL2BAN_JAIL_FILE"
 systemctl restart fail2ban >/dev/null 2>&1
 colorize yellow "Fail2Ban SSH jail removed (Fail2Ban itself stays installed/running for any other jails on the system)."
 }
+json_escape() {
+local s="$1"
+s="${s//\\/\\\\}"
+s="${s//\"/\\\"}"
+echo "$s"
+}
+# One JSON object per matching tunnel, one per line (caller joins with mapfile
+# + IFS=,) — role is inferred from the iran/kharej filename prefix the same
+# way every core's own listing UI already does it, active from systemctl.
+emit_engine_tunnels_json() {
+local dir="$1" engine="$2" prefix="$3" ext="$4"
+local f name role active
+for f in "${dir}"/iran*."${ext}" "${dir}"/kharej*."${ext}"; do
+[[ -f "$f" ]] || continue
+name=$(basename "${f%."${ext}"}")
+if [[ "$name" == iran* ]]; then role="server"; else role="client"; fi
+if systemctl is-active --quiet "${prefix}-${name}.service" 2>/dev/null; then active="true"; else active="false"; fi
+printf '{"engine":"%s","name":"%s","role":"%s","active":%s}\n' "$(json_escape "$engine")" "$(json_escape "$name")" "$role" "$active"
+done
+}
 cpu_usage_percent() {
 [[ -r /proc/stat ]] || { echo "NA"; return 1; }
 local -a f1 f2

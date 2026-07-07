@@ -42,6 +42,50 @@ source "${INSTALL_DIR}/core/frp/core.sh"
 # shellcheck source=core/tuic/core.sh
 source "${INSTALL_DIR}/core/tuic/core.sh"
 
+emit_metrics_json() {
+local hostname cpu mem_used mem_total mem_pct iface rx tx
+hostname=$(hostname)
+cpu=$(cpu_usage_percent)
+read -r mem_used mem_total mem_pct <<< "$(mem_usage_info)"
+iface=$(detect_default_interface)
+read -r rx tx <<< "$(net_rate_kbps "$iface")"
+printf '{"hostname":"%s","cpu_percent":"%s","memory":{"used_mb":"%s","total_mb":"%s","percent":"%s"},"network":{"interface":"%s","rx_kbps":"%s","tx_kbps":"%s"},"timestamp":"%s"}\n' \
+"$(json_escape "$hostname")" "$cpu" "$mem_used" "$mem_total" "$mem_pct" "$(json_escape "$iface")" "$rx" "$tx" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+
+emit_status_json() {
+local hostname gost_active gost_entities
+hostname=$(hostname)
+if systemctl is-active --quiet "$GOST_SERVICE_NAME" 2>/dev/null; then gost_active="true"; else gost_active="false"; fi
+gost_entities=$(( $(core_gost_list_services | grep -c .) + $(core_gost_list_chains | grep -c .) ))
+local -a lines=()
+mapfile -t lines < <(
+emit_engine_tunnels_json "$config_dir" "backhaul" "backhaul" "toml"
+emit_engine_tunnels_json "$RATHOLE_DIR" "rathole" "rathole" "toml"
+emit_engine_tunnels_json "$HYSTERIA2_DIR" "hysteria2" "hysteria2" "yaml"
+emit_engine_tunnels_json "$FRP_DIR" "frp" "frp" "toml"
+emit_engine_tunnels_json "$TUIC_DIR" "tuic" "tuic" "toml"
+)
+local joined
+joined=$(IFS=,; echo "${lines[*]}")
+printf '{"hostname":"%s","tunnels":[%s],"gost":{"active":%s,"entities":%d}}\n' \
+"$(json_escape "$hostname")" "$joined" "$gost_active" "$gost_entities"
+}
+
+# --list-json/--metrics-json are the machine-readable interface a remote
+# Agent shells out to (see tunnel-panel/agent) — kept deliberately fast and
+# side-effect-free: no network IP-detection calls, no core-install checks,
+# nothing interactive. Checked before any of that startup work runs, not
+# after, specifically so polling this every few seconds stays cheap.
+if [[ "$SCRIPT_MODE" == "--list-json" ]]; then
+emit_status_json
+exit 0
+fi
+if [[ "$SCRIPT_MODE" == "--metrics-json" ]]; then
+emit_metrics_json
+exit 0
+fi
+
 SERVER_IP=$(hostname -I | awk '{print $1}')
 SERVER_COUNTRY=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.country' 2>/dev/null)
 SERVER_ISP=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.isp' 2>/dev/null)
