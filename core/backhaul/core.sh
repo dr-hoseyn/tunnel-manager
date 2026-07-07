@@ -1470,7 +1470,7 @@ done
 fi
 sleep 2
 }
-check_tunnel_status() {
+core_backhaul_status() {
 if ! ls "$config_dir"/*.toml 1> /dev/null 2>&1; then
 colorize red "No config files found." bold
 press_key
@@ -1504,7 +1504,7 @@ done
 echo
 press_key
 }
-tunnel_management() {
+core_backhaul_manage() {
 if ! ls "$config_dir"/*.toml 1> /dev/null 2>&1; then
 colorize red "No config files found." bold
 press_key
@@ -2093,7 +2093,7 @@ install_jq
 download_and_extract_backhaul
 check_config_backup
 }
-configure_tunnel() {
+core_backhaul_configure() {
 [[ ! -d "$config_dir" ]] && {
 colorize red "Install Backhaul-Core first."
 press_key

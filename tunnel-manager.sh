@@ -2,12 +2,9 @@
 # Main entrypoint. Sources the shared library and every tunnel core, then
 # drives the top-level menu. Backhaul's own items (1-3) are wired directly to
 # its functions, unchanged in position/numbering/behavior from the
-# pre-refactor script. Adding a new core (frp, hysteria, tuic, ...) means
-# writing core/<name>/core.sh with the same core_<name>_* functions used
-# below (ensure_ready, menu, destroy_all, watchdog_check_all), giving it its
-# own top-level display_menu()/read_option() entry, and adding it to the
-# cross-core dispatchers (run_watchdog_check, uninstall_everything) — the
-# rest of the app does not need to change.
+# pre-refactor script. Adding a new core (FRP, TUIC, ...) means writing
+# core/<name>/core.sh and wiring it in four places — see core/README.md for
+# the full plugin interface contract and a step-by-step checklist.
 SCRIPT_VERSION="v2.0.0"
 SCRIPT_MODE="$1"
 INSTALL_DIR="/opt/tunnel-manager"
@@ -38,6 +35,8 @@ source "${INSTALL_DIR}/core/backhaul/core.sh"
 source "${INSTALL_DIR}/core/rathole/core.sh"
 # shellcheck source=core/gost/core.sh
 source "${INSTALL_DIR}/core/gost/core.sh"
+# shellcheck source=core/hysteria2/core.sh
+source "${INSTALL_DIR}/core/hysteria2/core.sh"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 SERVER_COUNTRY=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.country' 2>/dev/null)
@@ -61,6 +60,7 @@ run_watchdog_check() {
 core_backhaul_watchdog_check_all
 core_rathole_watchdog_check_all
 core_gost_watchdog_check
+core_hysteria2_watchdog_check_all
 }
 
 uninstall_everything() {
@@ -70,7 +70,7 @@ colorize red "  FULL UNINSTALL — THIS IS DESTRUCTIVE" bold
 colorize red "═══════════════════════════════════════" bold
 echo ""
 echo "This will:"
-echo "  - Stop and remove every configured tunnel (Backhaul, Rathole, GOST) and their firewall/forwarding rules"
+echo "  - Stop and remove every configured tunnel (Backhaul, Rathole, GOST, Hysteria2) and their firewall/forwarding rules"
 echo "  - Remove the watchdog timer"
 echo "  - Remove the journald size-limit and sysctl (ip_forward/rp_filter) drop-ins"
 echo "  - Remove any HAProxy/IPVS config this panel created (not the packages themselves)"
@@ -93,6 +93,8 @@ colorize yellow "Removing all Rathole tunnels..."
 core_rathole_destroy_all
 colorize yellow "Removing GOST..."
 core_gost_destroy_all
+colorize yellow "Removing all Hysteria2 tunnels..."
+core_hysteria2_destroy_all
 colorize yellow "Removing watchdog timer..."
 systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1
 rm -f "${service_dir}/backhaul-watchdog.timer" "${service_dir}/backhaul-watchdog.service"
@@ -157,27 +159,29 @@ colorize cyan " 3. Check tunnel status" bold
 echo "──────────────────────────────────"
 colorize green " 4. Rathole" bold
 colorize magenta " 5. GOST Manager" bold
+colorize yellow " 6. Hysteria2 (QUIC, DPI/throttling resistant)" bold
 echo "──────────────────────────────────"
-echo " 6. Update Backhaul Core"
-echo " 7. Update script"
-echo " 8. Remove Backhaul Core"
-colorize red " 9. Uninstall everything" bold
+echo " 7. Update Backhaul Core"
+echo " 8. Update script"
+echo " 9. Remove Backhaul Core"
+colorize red "10. Uninstall everything" bold
 echo " 0. Exit"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 read_option() {
-read -r -p "Enter your choice [0-9]: " choice
+read -r -p "Enter your choice [0-10]: " choice
 case $choice in
-1) configure_tunnel ;;
-2) tunnel_management ;;
-3) check_tunnel_status ;;
+1) core_backhaul_configure ;;
+2) core_backhaul_manage ;;
+3) core_backhaul_status ;;
 4) core_rathole_menu ;;
 5) core_gost_menu ;;
-6) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
-7) update_script ;;
-8) remove_core ;;
-9) uninstall_everything ;;
+6) core_hysteria2_menu ;;
+7) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
+8) update_script ;;
+9) remove_core ;;
+10) uninstall_everything ;;
 0) exit 0 ;;
 *) colorize red "Invalid option!" && sleep 1 ;;
 esac
