@@ -2074,15 +2074,20 @@ colorize green "✔ Removed ${config_name}"
 fi
 }
 remove_core() {
-if find "$config_dir" -type f -name "*.toml" | grep -q .; then
-colorize red "Delete all services first."
+# Scoped to backhaul_premium only, the exact inverse of "Update Backhaul
+# Core" (download_and_extract_backhaul) above — config_dir is now a shared
+# root for every core's configs/certs/binaries (rathole/, gost/, hysteria2/,
+# frp/, tuic/ all live under it), so removing the whole directory here would
+# silently wipe every other engine's tunnels too, not just Backhaul's.
+if find "$config_dir" -maxdepth 1 -type f \( -name "iran*.toml" -o -name "kharej*.toml" \) | grep -q .; then
+colorize red "Delete all Backhaul services first."
 sleep 3
 return 1
 fi
-colorize yellow "Remove Backhaul-Core? (y/n)"
+colorize yellow "Remove Backhaul-Core (backhaul_premium binary only)? (y/n)"
 read -r confirm
 if [[ $confirm == [yY] ]]; then
-[[ -d "$config_dir" ]] && rm -rf "$config_dir"
+rm -f "${config_dir}/backhaul_premium"
 colorize green "Backhaul-Core removed." bold
 fi
 press_key
