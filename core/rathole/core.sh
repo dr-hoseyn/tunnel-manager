@@ -111,6 +111,15 @@ fi
 echo "${addr##*:}"
 }
 
+core_rathole_suggest_free_port() {
+local mode="$1" prefix port=2333
+[[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
+while [[ -f "${RATHOLE_DIR}/${prefix}${port}.toml" ]] || is_port_listening_system_wide "$port"; do
+((port++))
+done
+echo "$port"
+}
+
 core_rathole_list_service_ports() {
 local file="$1" role="$2" section
 [[ "$role" == "server" ]] && section="server" || section="client"
@@ -212,7 +221,9 @@ colorize cyan "Configuring Rathole $([[ "$mode" == "server" ]] && echo "IRAN (Se
 echo ""
 local ctrl_addr token ports_csv peer_ip peer_ssh_port
 if [[ "$mode" == "server" ]]; then
-prompt_with_default "Bind Address" "${default_ctrl_addr:-:2333}" ctrl_addr
+local suggested_port="${default_ctrl_addr#:}"
+[[ -z "$suggested_port" ]] && suggested_port=$(core_rathole_suggest_free_port "server")
+prompt_with_default "Bind Address" "$suggested_port" ctrl_addr
 [[ -n "$ctrl_addr" && "$ctrl_addr" != *:* ]] && ctrl_addr=":${ctrl_addr}"
 else
 while true; do
