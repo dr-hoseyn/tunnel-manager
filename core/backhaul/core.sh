@@ -1,120 +1,11 @@
 #!/usr/bin/env bash
-SCRIPT_VERSION="v1.0.0"
-SCRIPT_MODE="$1"
-PANEL_PATH="/usr/local/bin/backhaul"
-service_dir="/etc/systemd/system"
-config_dir="/root/backhaul-core"
-CERT_DIR="/root/backhaul-core/cert_files"
-CERT_FILE="$CERT_DIR/cert.crt"
-KEY_FILE="$CERT_DIR/cert.key"
-mkdir -p "$CERT_DIR"
-if [[ $EUID -ne 0 ]]; then
-echo "This script must be run as root"
-sleep 1
-exit 1
-fi
-colorize() {
-local color="$1"
-local text="$2"
-local style="${3:-normal}"
-local black="\033[30m" red="\033[31m" green="\033[32m" yellow="\033[33m"
-local blue="\033[34m" magenta="\033[35m" cyan="\033[36m" white="\033[37m"
-local reset="\033[0m" normal="\033[0m" bold="\033[1m" underline="\033[4m"
-local color_code
-case $color in
-black) color_code=$black ;; red) color_code=$red ;;
-green) color_code=$green ;; yellow) color_code=$yellow ;;
-blue) color_code=$blue ;; magenta) color_code=$magenta ;;
-cyan) color_code=$cyan ;; white) color_code=$white ;;
-*) color_code=$reset ;;
-esac
-local style_code
-case $style in
-bold) style_code=$bold ;; underline) style_code=$underline ;;
-normal | *) style_code=$normal ;;
-esac
-echo -e "${style_code}${color_code}${text}${reset}"
-}
-press_key() {
-read -r -p "Press any key to continue..."
-}
-prompt_with_default() {
-local prompt="$1"
-local default="$2"
-local var_name="$3"
-local input
-echo -ne "[-] $prompt (default: $default): "
-read -r input
-eval "$var_name=\"${input:-$default}\""
-}
-prompt_boolean() {
-local prompt="$1"
-local default="$2"
-local var_name="$3"
-while true; do
-prompt_with_default "$prompt [true/false]" "$default" "$var_name"
-local value="${!var_name}"
-if [[ "$value" == "true" || "$value" == "false" ]]; then
-break
-fi
-colorize red "Invalid input. Please enter 'true' or 'false'."
-done
-}
-validate_cidr() {
-local cidr="$1"
-if [[ ! "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]{1,2})$ ]]; then
-return 1
-fi
-IFS='/' read -r ip mask <<< "$cidr"
-IFS='.' read -r a b c d <<< "$ip"
-a=$((10#$a)); b=$((10#$b)); c=$((10#$c)); d=$((10#$d)); mask=$((10#$mask))
-if (( a<0 || a>255 || b<0 || b>255 || c<0 || c>255 || d<0 || d>255 )); then
-return 1
-fi
-if (( mask < 1 || mask > 32 )); then
-return 1
-fi
-local ip_int=$(( (a << 24) | (b << 16) | (c << 8) | d ))
-local mask_int
-if (( mask == 32 )); then
-mask_int=0xFFFFFFFF
-else
-mask_int=$(( (0xFFFFFFFF << (32 - mask)) & 0xFFFFFFFF ))
-fi
-local net_int=$(( ip_int & mask_int ))
-local broadcast_int=$(( net_int | (~mask_int & 0xFFFFFFFF) ))
-if (( ip_int == net_int )); then
-return 1
-fi
-if (( ip_int == broadcast_int )); then
-return 1
-fi
-return 0
-}
-cidr_range() {
-local cidr="$1"
-local ip="${cidr%/*}"
-local mask="${cidr#*/}"
-local a b c d
-IFS='.' read -r a b c d <<< "$ip"
-a=$((10#$a)); b=$((10#$b)); c=$((10#$c)); d=$((10#$d)); mask=$((10#$mask))
-local ip_int=$(( (a << 24) | (b << 16) | (c << 8) | d ))
-local mask_int
-if (( mask == 0 )); then
-mask_int=0
-else
-mask_int=$(( (0xFFFFFFFF << (32 - mask)) & 0xFFFFFFFF ))
-fi
-local net_int=$(( ip_int & mask_int ))
-local broadcast_int=$(( net_int | (~mask_int & 0xFFFFFFFF) ))
-echo "$net_int $broadcast_int"
-}
-cidr_overlaps() {
-local net1 bcast1 net2 bcast2
-read -r net1 bcast1 <<< "$(cidr_range "$1")"
-read -r net2 bcast2 <<< "$(cidr_range "$2")"
-(( net1 <= bcast2 && net2 <= bcast1 ))
-}
+# Backhaul tunnel core. Behavior is unchanged from the original single-file
+# backhaul.sh; this is the same code, just living in its own module so other
+# cores (rathole, and later gost/frp/...) can sit alongside it without
+# touching this file. Requires lib/common.sh to already be sourced.
+
+VALID_ALGORITHMS=("aes-256-gcm" "chacha20-poly1305" "aes-128-gcm")
+
 existing_tun_cidrs() {
 awk '
 FNR==1 { in_tun=0 }
@@ -213,21 +104,6 @@ candidate="${base}${n}"
 done
 echo "$candidate"
 }
-detect_default_interface() {
-local iface
-iface=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
-if [[ -z "$iface" ]]; then
-iface=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
-fi
-echo "$iface"
-}
-persist_line_once() {
-local line="$1"
-local file="$2"
-mkdir -p "$(dirname "$file")"
-touch "$file"
-grep -qxF "$line" "$file" || echo "$line" >> "$file"
-}
 prepare_tun_ipx_kernel() {
 local is_ipx="$1"
 local profile="$2"
@@ -268,15 +144,6 @@ persist_line_once "$mod" "/etc/modules-load.d/backhaul-tunnel.conf"
 fi
 fi
 colorize green "Kernel prerequisites applied."
-}
-persist_iptables_rules() {
-if command -v netfilter-persistent &> /dev/null; then
-netfilter-persistent save >/dev/null 2>&1
-elif command -v iptables-save &> /dev/null && [[ -d /etc/iptables ]]; then
-iptables-save > /etc/iptables/rules.v4 2>/dev/null
-else
-colorize yellow "Note: this iptables rule is not persisted across reboot (install iptables-persistent to persist)."
-fi
 }
 allow_forwarded_ports_firewall() {
 local mapping="$1" accept_udp="$2" entry listen proto
@@ -554,7 +421,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
 }
-run_watchdog_check() {
+core_backhaul_watchdog_check_all() {
 local config_path config_name service_name is_tun tun_name
 for config_path in "${config_dir}"/{iran,kharej}*.toml; do
 [[ -f "$config_path" ]] || continue
@@ -574,17 +441,6 @@ systemctl restart "$service_name" 2>/dev/null
 fi
 fi
 done
-}
-ensure_journal_limits() {
-local conf_dir="/etc/systemd/journald.conf.d"
-local conf_file="${conf_dir}/backhaul-tunnel.conf"
-[[ -f "$conf_file" ]] && return
-mkdir -p "$conf_dir" 2>/dev/null
-cat > "$conf_file" <<EOF
-[Journal]
-SystemMaxUse=200M
-EOF
-systemctl restart systemd-journald >/dev/null 2>&1
 }
 allow_ipx_protocol_firewall() {
 local profile="$1"
@@ -639,23 +495,6 @@ local config_name="$1"
 local f="${config_dir}/.status/${config_name}.status"
 [[ -f "$f" ]] && cat "$f" || echo "Never tested|-"
 }
-toml_get() {
-local file="$1" section="$2" key="$3"
-awk -v want_section="[$section]" -v want_key="$key" '
-FNR==1 { insec=0 }
-/^\[/ { insec = ($0 == want_section) }
-insec {
-n = length(want_key)
-if (substr($0,1,n) == want_key && substr($0,n+1,1) ~ /[ =]/) {
-line=$0
-sub(/^[^=]*=[ \t]*/, "", line)
-gsub(/^"|"$/, "", line)
-print line
-exit
-}
-}
-' "$file" 2>/dev/null
-}
 tunnel_role() {
 local file="$1"
 if grep -q '^\[listener\]$' "$file" 2>/dev/null; then
@@ -691,59 +530,6 @@ tunnel_peer_ssh_port() {
 local p
 p=$(read_tunnel_meta "$1" "peer_ssh_port")
 echo "${p:-22}"
-}
-tcp_port_open() {
-local host="$1" port="$2" timeout="${3:-3}"
-timeout "$timeout" bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null
-}
-ping_stats() {
-local host="$1" count="${2:-5}"
-if ! command -v ping &> /dev/null; then
-echo "NA NA"; return 1
-fi
-local out
-out=$(ping -c "$count" -W 2 "$host" 2>/dev/null)
-if [[ -z "$out" ]]; then
-echo "NA NA"; return 1
-fi
-local avg loss
-avg=$(echo "$out" | grep -oP '(?<= = )[0-9.]+/[0-9.]+/[0-9.]+/[0-9.]+(?= ms)' | awk -F/ '{print $2}')
-loss=$(echo "$out" | grep -oP '[0-9]+(?=% packet loss)')
-echo "${avg:-NA} ${loss:-NA}"
-}
-tun_iface_exists() {
-ip link show "$1" &>/dev/null
-}
-check_health_endpoint() {
-local port="$1" http_code
-[[ -z "$port" ]] && { echo "N/A"; return 1; }
-if command -v curl &> /dev/null; then
-http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${port}/" 2>/dev/null)
-if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-echo "OK"
-return 0
-fi
-fi
-if tcp_port_open "127.0.0.1" "$port" 2; then
-echo "OPEN"
-return 0
-fi
-echo "DOWN"
-return 1
-}
-tunnel_traffic_stats() {
-local service_name="$1" rx tx
-rx=$(systemctl show "$service_name" -p IPIngressBytes --value 2>/dev/null)
-tx=$(systemctl show "$service_name" -p IPEgressBytes --value 2>/dev/null)
-if [[ -z "$rx" || "$rx" == "[not set]" || "$rx" == "18446744073709551615" ]]; then
-echo ""
-return
-fi
-if command -v numfmt &> /dev/null; then
-rx=$(numfmt --to=iec --suffix=B "$rx" 2>/dev/null)
-tx=$(numfmt --to=iec --suffix=B "$tx" 2>/dev/null)
-fi
-echo "RX ${rx:-0}  TX ${tx:-0}"
 }
 local_role_ready() {
 local config_path="$1" is_tun="$2" tun_name="$3" config_name service_name
@@ -941,9 +727,6 @@ fi
 [[ -n "$backup_bin" ]] && rm -f "$backup_bin"
 colorize green "Backhaul installation completed."
 }
-install_jq
-download_and_extract_backhaul
-declare -A CONFIG
 reset_config() {
 CONFIG=()
 }
@@ -988,7 +771,6 @@ prompt_with_default "Peer SSH Port (for diagnostics)" "22" CONFIG[peer_ssh_port]
 fi
 echo ""
 }
-VALID_ALGORITHMS=("aes-256-gcm" "chacha20-poly1305" "aes-128-gcm")
 is_valid_algorithm() {
 local input="$1"
 for alg in "${VALID_ALGORITHMS[@]}"; do
@@ -1523,9 +1305,6 @@ systemctl daemon-reload
 systemctl enable --now "backhaul-${type}${port}.service" >/dev/null 2>&1
 colorize green "✔ Service backhaul-${type}${port} created and started" bold
 }
-SERVER_IP=$(hostname -I | awk '{print $1}')
-SERVER_COUNTRY=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.country')
-SERVER_ISP=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.isp')
 display_logo() {
 echo -e "\033[36m"
 cat << "EOF"
@@ -1612,7 +1391,6 @@ done
 fi
 sleep 2
 }
-check_config_backup
 check_tunnel_status() {
 if ! ls "$config_dir"/*.toml 1> /dev/null 2>&1; then
 colorize red "No config files found." bold
@@ -1767,22 +1545,6 @@ local config_name
 config_name=$(basename "${file%.toml}")
 CONFIG[peer_ip]=$(tunnel_peer_ip "$file" "$config_name")
 CONFIG[peer_ssh_port]=$(tunnel_peer_ssh_port "$config_name")
-}
-backup_tunnel() {
-local config_path="$1" service_path="$2" config_name="$3" ts backup_dir
-ts=$(date +%Y%m%d%H%M%S)
-backup_dir="${config_dir}/.backups/${config_name}.${ts}"
-mkdir -p "$backup_dir"
-[[ -f "$config_path" ]] && cp -p "$config_path" "$backup_dir/config.toml"
-[[ -f "$service_path" ]] && cp -p "$service_path" "$backup_dir/service.service"
-echo "$backup_dir"
-}
-restore_tunnel_backup() {
-local backup_dir="$1" config_path="$2" service_path="$3" service_name="$4"
-[[ -f "$backup_dir/config.toml" ]] && cp -p "$backup_dir/config.toml" "$config_path"
-[[ -f "$backup_dir/service.service" ]] && cp -p "$backup_dir/service.service" "$service_path"
-systemctl daemon-reload
-systemctl restart "$service_name" 2>/dev/null
 }
 toggle_tunnel_enabled() {
 local service_name="$1"
@@ -2028,71 +1790,6 @@ case "$choice" in
 *) colorize red "Invalid choice"; sleep 1 ;;
 esac
 }
-benchmark_tcp_probe() {
-local peer_ip="$1" port="$2" start end elapsed success=0 i
-local latencies=()
-for i in 1 2 3 4 5; do
-start=$(date +%s%N)
-if tcp_port_open "$peer_ip" "$port" 2; then
-end=$(date +%s%N)
-elapsed=$(( (end-start)/1000000 ))
-latencies+=("$elapsed")
-success=$((success+1))
-fi
-done
-local n=${#latencies[@]}
-if (( n == 0 )); then
-echo "NA NA NA"
-return
-fi
-local sum=0 l
-for l in "${latencies[@]}"; do sum=$((sum+l)); done
-local avg=$((sum/n))
-local loss=$(( (5-success)*100/5 ))
-local throughput="NA"
-if command -v iperf3 &> /dev/null; then
-local iperf_out
-iperf_out=$(timeout 6 iperf3 -c "$peer_ip" -p 5201 -t 3 -J 2>/dev/null)
-if [[ -n "$iperf_out" ]]; then
-throughput=$(echo "$iperf_out" | grep -oP '"bits_per_second":\s*\K[0-9.]+' | tail -1)
-[[ -n "$throughput" ]] && throughput=$(awk -v b="$throughput" 'BEGIN{printf "%.0f", b/1000000}')
-fi
-fi
-echo "$avg $loss ${throughput:-NA}"
-}
-benchmark_icmp_probe() {
-local peer_ip="$1" avg loss
-read -r avg loss <<< "$(ping_stats "$peer_ip" 10)"
-echo "$avg $loss NA"
-}
-benchmark_raw_protocol_probe() {
-local peer_ip="$1" proto_num="$2"
-if ! command -v hping3 &> /dev/null; then
-echo "UNSUPPORTED"
-return
-fi
-if timeout 5 hping3 -c 3 --rawip -H "$proto_num" "$peer_ip" 2>/dev/null | grep -q "bytes from"; then
-echo "OK"
-else
-echo "BLOCKED"
-fi
-}
-score_result() {
-local latency="$1" loss="$2"
-if [[ "$latency" == "NA" ]]; then echo 999999; return; fi
-latency=$(printf "%.0f" "$latency")
-echo $(( latency + loss*20 ))
-}
-status_label() {
-local latency="$1" loss="$2"
-if [[ "$latency" == "NA" ]]; then echo "Unusable"; return; fi
-latency=$(printf "%.0f" "$latency")
-if (( loss == 0 && latency < 80 )); then echo "Excellent"
-elif (( loss <= 2 && latency < 150 )); then echo "Good"
-elif (( loss <= 5 && latency < 300 )); then echo "Fair"
-else echo "Poor"
-fi
-}
 benchmark_tunnel_protocols() {
 local config_path="$1" config_name peer_ip port
 config_name=$(basename "${config_path%.toml}")
@@ -2290,27 +1987,6 @@ else
 colorize green "✔ Removed ${config_name}"
 fi
 }
-restart_service() {
-echo
-colorize yellow "Restarting $1" bold
-if systemctl list-units --type=service | grep -q "$1"; then
-systemctl restart "$1"
-colorize green "Service restarted successfully" bold
-echo
-else
-colorize red "Service not found"
-fi
-press_key
-}
-view_service_logs() {
-clear
-journalctl -eu "$1" -f -o cat
-}
-view_service_status() {
-clear
-systemctl status "$1"
-press_key
-}
 remove_core() {
 if find "$config_dir" -type f -name "*.toml" | grep -q .; then
 colorize red "Delete all services first."
@@ -2325,73 +2001,17 @@ colorize green "Backhaul-Core removed." bold
 fi
 press_key
 }
-uninstall_everything() {
-clear
-colorize red "═══════════════════════════════════════" bold
-colorize red "  FULL UNINSTALL — THIS IS DESTRUCTIVE" bold
-colorize red "═══════════════════════════════════════" bold
-echo ""
-echo "This will:"
-echo "  - Stop and remove every configured tunnel and its firewall/forwarding rules"
-echo "  - Remove the watchdog timer"
-echo "  - Remove the journald size-limit and sysctl (ip_forward/rp_filter) drop-ins"
-echo "  - Remove any HAProxy/IPVS config this panel created (not the packages themselves)"
-echo "  - Delete ${config_dir} (all configs, certs, backups, the core binary)"
-echo "  - Delete this panel script (${PANEL_PATH})"
-echo ""
-colorize yellow "This cannot be undone."
-echo ""
-local confirm
-read -r -p "Type UNINSTALL (all caps) to proceed, anything else to cancel: " confirm
-if [[ "$confirm" != "UNINSTALL" ]]; then
-colorize yellow "Cancelled."
-press_key
-return
-fi
-echo ""
-colorize yellow "Removing all tunnels..."
+core_backhaul_destroy_all() {
 local config_path
 for config_path in "${config_dir}"/{iran,kharej}*.toml; do
 [[ -f "$config_path" ]] || continue
 destroy_tunnel "$config_path" --silent
 done
-colorize yellow "Removing watchdog timer..."
-systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1
-rm -f "${service_dir}/backhaul-watchdog.timer" "${service_dir}/backhaul-watchdog.service"
-systemctl daemon-reload
-colorize yellow "Removing journald and sysctl drop-ins..."
-rm -f /etc/systemd/journald.conf.d/backhaul-tunnel.conf
-systemctl restart systemd-journald >/dev/null 2>&1
-rm -f /etc/sysctl.d/99-backhaul-tunnel.conf
-rm -f /etc/modules-load.d/backhaul-tunnel.conf
-colorize yellow "Removing config directory..."
-rm -rf "$config_dir"
-colorize green "✔ Backhaul fully removed."
-sleep 1
-colorize yellow "Deleting this script..."
-rm -f "$PANEL_PATH"
-echo ""
-colorize green "Done. Goodbye."
-exit 0
 }
-update_script() {
-local script_url="https://raw.githubusercontent.com/dr-hoseyn/tunnel-manager/main/backhaul.sh"
-local target="$PANEL_PATH"
-[[ -f "$target" ]] || target="$0"
-colorize yellow "Updating management script..."
-local tmp
-tmp=$(mktemp "$(dirname "$target")/.backhaul.XXXXXX")
-if curl -fsSL "$script_url" -o "$tmp"; then
-chmod +x "$tmp"
-mv -f "$tmp" "$target"
-colorize green "✔ Script updated. Restarting..."
-sleep 1
-exec bash "$target"
-else
-colorize red "✘ Download failed."
-rm -f "$tmp"
-press_key
-fi
+core_backhaul_ensure_ready() {
+install_jq
+download_and_extract_backhaul
+check_config_backup
 }
 configure_tunnel() {
 [[ ! -d "$config_dir" ]] && {
@@ -2411,41 +2031,3 @@ case "$configure_choice" in
 *) colorize red "Invalid option!" && sleep 1 ;;
 esac
 }
-display_menu() {
-clear
-display_logo
-display_server_info
-display_backhaul_core_status
-echo
-colorize green " 1. Configure a new tunnel" bold
-colorize red " 2. Tunnel management" bold
-colorize cyan " 3. Check tunnel status" bold
-echo " 4. Update Backhaul Core"
-echo " 5. Update script"
-echo " 6. Remove Backhaul Core"
-colorize red " 7. Uninstall everything" bold
-echo " 0. Exit"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-}
-read_option() {
-read -r -p "Enter your choice [0-7]: " choice
-case $choice in
-1) configure_tunnel ;;
-2) tunnel_management ;;
-3) check_tunnel_status ;;
-4) download_and_extract_backhaul "menu" ;;
-5) update_script ;;
-6) remove_core ;;
-7) uninstall_everything ;;
-0) exit 0 ;;
-*) colorize red "Invalid option!" && sleep 1 ;;
-esac
-}
-if [[ "$SCRIPT_MODE" == "--watchdog" ]]; then
-run_watchdog_check
-exit 0
-fi
-while true; do
-display_menu
-read_option
-done
