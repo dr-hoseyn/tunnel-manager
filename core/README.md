@@ -29,9 +29,10 @@ addition.
 
 ## Common internal shape (not enforced, but follow it)
 
-Within a core, `core/rathole/core.sh` and `core/hysteria2/core.sh` are the
-reference implementations to copy from — Hysteria2 was written by mirroring
-Rathole function-for-function. Both follow this shape:
+Within a core, `core/rathole/core.sh`, `core/hysteria2/core.sh`, and
+`core/frp/core.sh` are the reference implementations to copy from — each was
+written by mirroring the previous one function-for-function. All three
+follow this shape:
 
 - `core_<name>_configure(mode, existing_config)` — prompts for a new tunnel,
   or (when `existing_config` is passed) prefills every prompt's default from
@@ -53,9 +54,9 @@ Shared, cross-core helpers (`write_tunnel_meta`, `read_tunnel_meta`,
 `write_tunnel_last_test`, `read_tunnel_last_test`, `ensure_watchdog_installed`,
 `toggle_tunnel_enabled`, `parse_port_entry`) live in `core/backhaul/core.sh`
 today because that's the first core that needed them and every other core is
-sourced after it — not because they're Backhaul-specific. Rathole and
-Hysteria2 both already depend on this. Give tunnel identities a
-`<name>-` prefix (`rathole-iran2333`, `hysteria2-iran36712`) when calling
+sourced after it — not because they're Backhaul-specific. Rathole, Hysteria2,
+and FRP all already depend on this. Give tunnel identities a `<name>-` prefix
+(`rathole-iran2333`, `hysteria2-iran36712`, `frp-iran7000`) when calling
 these so they never collide with a same-numbered Backhaul tunnel.
 
 ## Checklist for adding a new core

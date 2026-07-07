@@ -37,6 +37,8 @@ source "${INSTALL_DIR}/core/rathole/core.sh"
 source "${INSTALL_DIR}/core/gost/core.sh"
 # shellcheck source=core/hysteria2/core.sh
 source "${INSTALL_DIR}/core/hysteria2/core.sh"
+# shellcheck source=core/frp/core.sh
+source "${INSTALL_DIR}/core/frp/core.sh"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 SERVER_COUNTRY=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.country' 2>/dev/null)
@@ -61,6 +63,7 @@ core_backhaul_watchdog_check_all
 core_rathole_watchdog_check_all
 core_gost_watchdog_check
 core_hysteria2_watchdog_check_all
+core_frp_watchdog_check_all
 }
 
 uninstall_everything() {
@@ -70,7 +73,7 @@ colorize red "  FULL UNINSTALL — THIS IS DESTRUCTIVE" bold
 colorize red "═══════════════════════════════════════" bold
 echo ""
 echo "This will:"
-echo "  - Stop and remove every configured tunnel (Backhaul, Rathole, GOST, Hysteria2) and their firewall/forwarding rules"
+echo "  - Stop and remove every configured tunnel (Backhaul, Rathole, GOST, Hysteria2, FRP) and their firewall/forwarding rules"
 echo "  - Remove the watchdog timer"
 echo "  - Remove the journald size-limit and sysctl (ip_forward/rp_filter) drop-ins"
 echo "  - Remove any HAProxy/IPVS config this panel created (not the packages themselves)"
@@ -95,6 +98,8 @@ colorize yellow "Removing GOST..."
 core_gost_destroy_all
 colorize yellow "Removing all Hysteria2 tunnels..."
 core_hysteria2_destroy_all
+colorize yellow "Removing all FRP tunnels..."
+core_frp_destroy_all
 colorize yellow "Removing watchdog timer..."
 systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1
 rm -f "${service_dir}/backhaul-watchdog.timer" "${service_dir}/backhaul-watchdog.service"
@@ -160,17 +165,18 @@ echo "────────────────────────�
 colorize green " 4. Rathole" bold
 colorize magenta " 5. GOST Manager" bold
 colorize yellow " 6. Hysteria2 (QUIC, DPI/throttling resistant)" bold
+colorize blue " 7. FRP" bold
 echo "──────────────────────────────────"
-echo " 7. Update Backhaul Core"
-echo " 8. Update script"
-echo " 9. Remove Backhaul Core"
-colorize red "10. Uninstall everything" bold
+echo " 8. Update Backhaul Core"
+echo " 9. Update script"
+echo "10. Remove Backhaul Core"
+colorize red "11. Uninstall everything" bold
 echo " 0. Exit"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 read_option() {
-read -r -p "Enter your choice [0-10]: " choice
+read -r -p "Enter your choice [0-11]: " choice
 case $choice in
 1) core_backhaul_configure ;;
 2) core_backhaul_manage ;;
@@ -178,10 +184,11 @@ case $choice in
 4) core_rathole_menu ;;
 5) core_gost_menu ;;
 6) core_hysteria2_menu ;;
-7) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
-8) update_script ;;
-9) remove_core ;;
-10) uninstall_everything ;;
+7) core_frp_menu ;;
+8) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
+9) update_script ;;
+10) remove_core ;;
+11) uninstall_everything ;;
 0) exit 0 ;;
 *) colorize red "Invalid option!" && sleep 1 ;;
 esac
