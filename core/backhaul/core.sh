@@ -1020,12 +1020,7 @@ if [[ "$mode" == "client" ]]; then
 echo
 return
 fi
-if [[ ! -f "$CERT_FILE" || ! -f "$KEY_FILE" ]]; then
-colorize red "[*] TLS certificate or key missing, generating self-signed Ed25519 cert..."
-openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 -keyout "$KEY_FILE" -out  "$CERT_FILE" -subj "/CN=backhaul.com"
-colorize green "[*] Generated $CERT_FILE and $KEY_FILE"
-echo
-fi
+ensure_cert_fresh "$CERT_FILE" "$KEY_FILE" && echo
 prompt_with_default "TLS Certificate Path" "${CONFIG[tls_cert]:-$CERT_FILE}" CONFIG[tls_cert]
 prompt_with_default "TLS Key Path" "${CONFIG[tls_key]:-$KEY_FILE}" CONFIG[tls_key]
 echo ""
@@ -1409,6 +1404,17 @@ if [[ -f "${config_dir}/backhaul_premium" ]]; then
 echo -e "\033[36mBackhaul Core:\033[0m \033[32mInstalled\033[0m"
 else
 echo -e "\033[36mBackhaul Core:\033[0m \033[31mNot installed\033[0m"
+fi
+if [[ -f "$CERT_FILE" ]]; then
+local cert_days
+cert_days=$(cert_days_remaining "$CERT_FILE")
+if (( cert_days > 30 )); then
+echo -e "\033[36mTLS Certificate:\033[0m \033[32mvalid for ${cert_days} more days\033[0m"
+elif (( cert_days > 0 )); then
+echo -e "\033[36mTLS Certificate:\033[0m \033[33mexpires in ${cert_days} days (auto-renews via watchdog)\033[0m"
+else
+echo -e "\033[36mTLS Certificate:\033[0m \033[31mexpired (auto-renews via watchdog)\033[0m"
+fi
 fi
 echo -e "\e[93m═══════════════════════════════════════════\e[0m"
 }

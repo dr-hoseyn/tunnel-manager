@@ -151,6 +151,70 @@ ip=$(curl -fsS6 --max-time 2 "$url" 2>/dev/null | tr -d '[:space:]')
 done
 return 1
 }
+cert_days_remaining() {
+local cert_file="$1"
+[[ -f "$cert_file" ]] || { echo "-1"; return 1; }
+local end_date end_epoch now_epoch
+end_date=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2-)
+[[ -z "$end_date" ]] && { echo "-1"; return 1; }
+end_epoch=$(date -d "$end_date" +%s 2>/dev/null)
+[[ -z "$end_epoch" ]] && { echo "-1"; return 1; }
+now_epoch=$(date +%s)
+echo $(( (end_epoch - now_epoch) / 86400 ))
+}
+ensure_cert_fresh() {
+local cert_file="$1" key_file="$2"
+local days
+if [[ -f "$cert_file" && -f "$key_file" ]]; then
+days=$(cert_days_remaining "$cert_file")
+if (( days > 30 )); then
+return 1
+fi
+colorize yellow "[*] TLS certificate expires in ${days} day(s), renewing..."
+else
+colorize yellow "[*] TLS certificate or key missing, generating self-signed Ed25519 cert..."
+fi
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 -keyout "$key_file" -out "$cert_file" -subj "/CN=backhaul.com"
+colorize green "[*] Generated $cert_file and $key_file"
+return 0
+}
+FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/tunnel-manager-ssh.conf"
+fail2ban_ssh_status() {
+[[ -f "$FAIL2BAN_JAIL_FILE" ]] && systemctl is-active --quiet fail2ban 2>/dev/null && echo "enabled" || echo "disabled"
+}
+enable_fail2ban_ssh_protection() {
+if ! command -v fail2ban-client &> /dev/null; then
+colorize yellow "Installing Fail2Ban..."
+if command -v apt-get &> /dev/null; then
+apt-get update -qq >/dev/null 2>&1
+apt-get install -y fail2ban >/dev/null 2>&1
+elif command -v dnf &> /dev/null; then
+dnf install -y fail2ban >/dev/null 2>&1
+elif command -v yum &> /dev/null; then
+yum install -y fail2ban >/dev/null 2>&1
+fi
+fi
+if ! command -v fail2ban-client &> /dev/null; then
+colorize red "✘ Could not install Fail2Ban (unsupported package manager or no network)."
+return 1
+fi
+mkdir -p "$(dirname "$FAIL2BAN_JAIL_FILE")"
+cat > "$FAIL2BAN_JAIL_FILE" <<EOF
+[sshd]
+enabled = true
+maxretry = 5
+findtime = 10m
+bantime = 1h
+EOF
+systemctl enable --now fail2ban >/dev/null 2>&1
+systemctl restart fail2ban >/dev/null 2>&1
+colorize green "✔ Fail2Ban SSH protection enabled (5 failed attempts in 10 min -> 1 hour ban)."
+}
+disable_fail2ban_ssh_protection() {
+rm -f "$FAIL2BAN_JAIL_FILE"
+systemctl restart fail2ban >/dev/null 2>&1
+colorize yellow "Fail2Ban SSH jail removed (Fail2Ban itself stays installed/running for any other jails on the system)."
+}
 persist_line_once() {
 local line="$1"
 local file="$2"

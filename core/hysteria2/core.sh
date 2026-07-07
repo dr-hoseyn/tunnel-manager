@@ -126,11 +126,7 @@ press_key
 }
 
 core_hysteria2_ensure_cert() {
-if [[ ! -f "$CERT_FILE" || ! -f "$KEY_FILE" ]]; then
-colorize yellow "[*] TLS certificate or key missing, generating self-signed Ed25519 cert..."
-openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=backhaul.com"
-colorize green "[*] Generated $CERT_FILE and $KEY_FILE"
-fi
+ensure_cert_fresh "$CERT_FILE" "$KEY_FILE"
 }
 
 # ── YAML getters (see the file-header note: fixed generated shape only) ──

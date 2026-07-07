@@ -60,6 +60,31 @@ PUBLIC_IPV6=$(detect_public_ipv6)
 # eager about and no prior behavior to preserve.
 core_backhaul_ensure_ready
 
+# Only Hysteria2/TUIC servers always use the shared self-signed cert;
+# Backhaul only does for server-mode tunnels on wss/anytls/wssmux transports,
+# and only when the user kept the default cert path (a customized path means
+# it isn't ours to rotate, so it's deliberately left alone). Checked on every
+# watchdog run (every 5 minutes via the timer) so renewal happens well before
+# the 365-day cert actually expires, not just whenever someone next opens the
+# panel to configure or edit a tunnel.
+watchdog_renew_shared_cert() {
+ensure_cert_fresh "$CERT_FILE" "$KEY_FILE" || return 0
+logger -t cert-renewal "Shared self-signed cert renewed, restarting dependent services" 2>/dev/null
+local f
+for f in "${config_dir}"/iran*.toml; do
+[[ -f "$f" ]] || continue
+[[ "$(toml_get "$f" "tls" "tls_cert")" == "$CERT_FILE" ]] && systemctl restart "backhaul-$(basename "${f%.toml}").service" 2>/dev/null
+done
+for f in "${HYSTERIA2_DIR}"/iran*.yaml; do
+[[ -f "$f" ]] || continue
+systemctl restart "hysteria2-$(basename "${f%.yaml}").service" 2>/dev/null
+done
+for f in "${TUIC_DIR}"/iran*.toml; do
+[[ -f "$f" ]] || continue
+systemctl restart "tuic-$(basename "${f%.toml}").service" 2>/dev/null
+done
+}
+
 run_watchdog_check() {
 core_backhaul_watchdog_check_all
 core_rathole_watchdog_check_all
@@ -67,6 +92,7 @@ core_gost_watchdog_check
 core_hysteria2_watchdog_check_all
 core_frp_watchdog_check_all
 core_tuic_watchdog_check_all
+watchdog_renew_shared_cert
 }
 
 uninstall_everything() {
@@ -79,7 +105,7 @@ echo "This will:"
 echo "  - Stop and remove every configured tunnel (Backhaul, Rathole, GOST, Hysteria2, FRP, TUIC) and their firewall/forwarding rules"
 echo "  - Remove the watchdog timer"
 echo "  - Remove the journald size-limit and sysctl (ip_forward/rp_filter) drop-ins"
-echo "  - Remove any HAProxy/IPVS config this panel created (not the packages themselves)"
+echo "  - Remove any HAProxy/IPVS/Fail2Ban config this panel created (not the packages themselves)"
 echo "  - Delete ${config_dir} (all configs, certs, backups, both cores' binaries)"
 echo "  - Delete this panel (${INSTALL_DIR}, ${PANEL_PATH}, ${TUNNEL_MANAGER_PATH})"
 echo ""
@@ -109,6 +135,8 @@ colorize yellow "Removing watchdog timer..."
 systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1
 rm -f "${service_dir}/backhaul-watchdog.timer" "${service_dir}/backhaul-watchdog.service"
 systemctl daemon-reload
+colorize yellow "Removing Fail2Ban SSH jail (if this panel created one)..."
+[[ -f "$FAIL2BAN_JAIL_FILE" ]] && disable_fail2ban_ssh_protection >/dev/null 2>&1
 colorize yellow "Removing journald and sysctl drop-ins..."
 rm -f /etc/systemd/journald.conf.d/backhaul-tunnel.conf
 systemctl restart systemd-journald >/dev/null 2>&1
@@ -124,6 +152,41 @@ rm -rf "$INSTALL_DIR"
 echo ""
 colorize green "Done. Goodbye."
 exit 0
+}
+
+security_maintenance_menu() {
+while true; do
+clear
+colorize cyan "Security & Maintenance" bold
+echo ""
+if [[ -f "$CERT_FILE" ]]; then
+local cert_days
+cert_days=$(cert_days_remaining "$CERT_FILE")
+echo "TLS Certificate: valid for ${cert_days} more days (auto-renews via watchdog inside 30 days of expiry)"
+else
+echo "TLS Certificate: not generated yet (created automatically the first time a tunnel needs one)"
+fi
+echo "Fail2Ban SSH protection: $(fail2ban_ssh_status)"
+echo ""
+colorize green " 1. Renew TLS certificate now" bold
+colorize green " 2. Enable Fail2Ban SSH protection" bold
+colorize red " 3. Disable Fail2Ban SSH protection" bold
+echo " 0. Back"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+read -r -p "Enter your choice [0-3]: " choice
+case "$choice" in
+1)
+rm -f "$CERT_FILE" "$KEY_FILE"
+ensure_cert_fresh "$CERT_FILE" "$KEY_FILE"
+colorize yellow "Restart any TLS-using tunnels (Backhaul wss/anytls/wssmux, Hysteria2, TUIC) to pick up the new cert — or wait for the next watchdog cycle."
+press_key
+;;
+2) enable_fail2ban_ssh_protection; press_key ;;
+3) disable_fail2ban_ssh_protection; press_key ;;
+0) return ;;
+*) colorize red "Invalid option!"; sleep 1 ;;
+esac
+done
 }
 
 update_script() {
@@ -173,16 +236,18 @@ colorize yellow " 6. Hysteria2 (QUIC, DPI/throttling resistant)" bold
 colorize blue " 7. FRP" bold
 colorize magenta " 8. TUIC (QUIC, lightweight alternative)" bold
 echo "──────────────────────────────────"
-echo " 9. Update Backhaul Core"
-echo "10. Update script"
-echo "11. Remove Backhaul Core"
-colorize red "12. Uninstall everything" bold
+colorize blue " 9. Security & Maintenance (TLS cert, Fail2Ban)" bold
+echo "──────────────────────────────────"
+echo "10. Update Backhaul Core"
+echo "11. Update script"
+echo "12. Remove Backhaul Core"
+colorize red "13. Uninstall everything" bold
 echo " 0. Exit"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 read_option() {
-read -r -p "Enter your choice [0-12]: " choice
+read -r -p "Enter your choice [0-13]: " choice
 case $choice in
 1) core_backhaul_configure ;;
 2) core_backhaul_manage ;;
@@ -192,10 +257,11 @@ case $choice in
 6) core_hysteria2_menu ;;
 7) core_frp_menu ;;
 8) core_tuic_menu ;;
-9) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
-10) update_script ;;
-11) remove_core ;;
-12) uninstall_everything ;;
+9) security_maintenance_menu ;;
+10) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
+11) update_script ;;
+12) remove_core ;;
+13) uninstall_everything ;;
 0) exit 0 ;;
 *) colorize red "Invalid option!" && sleep 1 ;;
 esac
