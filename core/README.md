@@ -1,9 +1,9 @@
 # Tunnel core plugin interface
 
-Every tunnel engine (Backhaul, Rathole, GOST, Hysteria2, ...) lives in its own
-`core/<name>/core.sh` and is sourced once by `tunnel-manager.sh`. Adding a new
-engine means writing one new file and wiring four call sites — the rest of
-the app (menu shell, watchdog timer, uninstall) never changes.
+Every tunnel engine (Backhaul, Rathole, GOST, Hysteria2, FRP, TUIC, ...) lives
+in its own `core/<name>/core.sh` and is sourced once by `tunnel-manager.sh`.
+Adding a new engine means writing one new file and wiring four call sites —
+the rest of the app (menu shell, watchdog timer, uninstall) never changes.
 
 ## Required boundary (every core must expose these)
 
@@ -29,10 +29,10 @@ addition.
 
 ## Common internal shape (not enforced, but follow it)
 
-Within a core, `core/rathole/core.sh`, `core/hysteria2/core.sh`, and
-`core/frp/core.sh` are the reference implementations to copy from — each was
-written by mirroring the previous one function-for-function. All three
-follow this shape:
+Within a core, `core/rathole/core.sh`, `core/hysteria2/core.sh`,
+`core/frp/core.sh`, and `core/tuic/core.sh` are the reference implementations
+to copy from — each was written by mirroring the previous one
+function-for-function. All four follow this shape:
 
 - `core_<name>_configure(mode, existing_config)` — prompts for a new tunnel,
   or (when `existing_config` is passed) prefills every prompt's default from
@@ -55,9 +55,25 @@ Shared, cross-core helpers (`write_tunnel_meta`, `read_tunnel_meta`,
 `toggle_tunnel_enabled`, `parse_port_entry`) live in `core/backhaul/core.sh`
 today because that's the first core that needed them and every other core is
 sourced after it — not because they're Backhaul-specific. Rathole, Hysteria2,
-and FRP all already depend on this. Give tunnel identities a `<name>-` prefix
-(`rathole-iran2333`, `hysteria2-iran36712`, `frp-iran7000`) when calling
-these so they never collide with a same-numbered Backhaul tunnel.
+FRP, and TUIC all already depend on this. Give tunnel identities a `<name>-`
+prefix (`rathole-iran2333`, `hysteria2-iran36712`, `frp-iran7000`,
+`tuic-iran44300`) when calling these so they never collide with a
+same-numbered Backhaul tunnel.
+
+Each core also picks its own config format/tooling depending on what the
+upstream engine actually speaks and what's verifiable against real upstream
+docs/source — don't force a common format:
+
+| Core | Config format | Getter strategy |
+|---|---|---|
+| Backhaul, Rathole, FRP, TUIC | TOML (bracketed `[section]` tables) | Shared `toml_get()` in `lib/common.sh` for scalars; hand-written awk getters for any array-of-tables (FRP's `[[proxies]]`, TUIC's `[[local.tcp_forward]]`) |
+| Hysteria2 | YAML | No shared YAML parser exists — small grep/sed getters that only work because the generator emits a fixed, hand-controlled shape (see the file-header note in `core/hysteria2/core.sh`) |
+
+Port-forwarding direction also varies by engine, not by convention — follow
+what each upstream tool actually does rather than forcing IRAN/KHAREJ
+symmetry: Backhaul/Rathole/FRP put the forwarded-port config on the SERVER
+(IRAN) side; Hysteria2/TUIC put it on the CLIENT (KHAREJ) side, because
+that's where each protocol's own local-forward feature lives.
 
 ## Checklist for adding a new core
 
