@@ -105,6 +105,28 @@ read -r net1 bcast1 <<< "$(cidr_range "$1")"
 read -r net2 bcast2 <<< "$(cidr_range "$2")"
 (( net1 <= bcast2 && net2 <= bcast1 ))
 }
+save_last_used() {
+local key="$1" value="$2"
+local file="${config_dir}/.last_used.conf"
+[[ -z "$value" ]] && return 0
+mkdir -p "$(dirname "$file")"
+touch "$file"
+grep -v "^${key}=" "$file" 2>/dev/null > "${file}.tmp"
+echo "${key}=${value}" >> "${file}.tmp"
+mv -f "${file}.tmp" "$file"
+}
+get_last_used() {
+local key="$1" default="$2"
+local file="${config_dir}/.last_used.conf"
+local line
+[[ -f "$file" ]] || { echo "$default"; return; }
+line=$(grep "^${key}=" "$file" | tail -1)
+if [[ -n "$line" ]]; then
+echo "${line#*=}"
+else
+echo "$default"
+fi
+}
 detect_default_interface() {
 local iface
 iface=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
@@ -112,6 +134,22 @@ if [[ -z "$iface" ]]; then
 iface=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
 fi
 echo "$iface"
+}
+detect_public_ipv4() {
+local ip
+for url in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com"; do
+ip=$(curl -fsS4 --max-time 2 "$url" 2>/dev/null | tr -d '[:space:]')
+[[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "$ip"; return 0; }
+done
+return 1
+}
+detect_public_ipv6() {
+local ip
+for url in "https://api6.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com"; do
+ip=$(curl -fsS6 --max-time 2 "$url" 2>/dev/null | tr -d '[:space:]')
+[[ "$ip" == *:* ]] && { echo "$ip"; return 0; }
+done
+return 1
 }
 persist_line_once() {
 local line="$1"

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Main entrypoint. Sources the shared library and every tunnel core, then
-# drives the top-level menu. Adding a new core (frp, hysteria, tuic, ...)
-# means writing core/<name>/core.sh with the same core_<name>_* functions
-# used below (ensure_ready, configure_tunnel/menu, destroy_all,
-# watchdog_check_all) and adding it to tunnel_manager_menu() and the
+# drives the top-level menu. Backhaul's own items (1-3) are wired directly to
+# its functions, unchanged in position/numbering/behavior from the
+# pre-refactor script. Adding a new core (frp, hysteria, tuic, ...) means
+# writing core/<name>/core.sh with the same core_<name>_* functions used
+# below (ensure_ready, menu, destroy_all, watchdog_check_all), giving it its
+# own top-level display_menu()/read_option() entry, and adding it to the
 # cross-core dispatchers (run_watchdog_check, uninstall_everything) — the
 # rest of the app does not need to change.
 SCRIPT_VERSION="v2.0.0"
@@ -40,52 +42,20 @@ source "${INSTALL_DIR}/core/gost/core.sh"
 SERVER_IP=$(hostname -I | awk '{print $1}')
 SERVER_COUNTRY=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.country' 2>/dev/null)
 SERVER_ISP=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.isp' 2>/dev/null)
+# Detected once at startup and reused as prompt defaults (e.g. "Kharej Server
+# IP") so users aren't stuck typing their own public address every time.
+PUBLIC_IPV4=$(detect_public_ipv4)
+PUBLIC_IPV6=$(detect_public_ipv6)
 
-backhaul_menu() {
+# Matches the pre-refactor script's own startup sequence exactly (it ran
+# these three unconditionally before ever showing a menu). Kept eager here
+# for the same reason: Backhaul is the original, primary workflow and its
+# existing behavior — including this startup check — must not change.
+# Rathole/GOST stay lazy (core_rathole_ensure_ready / core_gost_ensure_ready
+# only run when their own menu is opened) since, unlike backhaul_premium,
+# install.sh doesn't pre-provision their binaries; there's nothing to be
+# eager about and no prior behavior to preserve.
 core_backhaul_ensure_ready
-while true; do
-clear
-colorize cyan "Backhaul" bold
-echo ""
-colorize green " 1. Configure a new tunnel" bold
-colorize red " 2. Tunnel management" bold
-colorize cyan " 3. Check tunnel status" bold
-echo " 0. Back"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-read -r -p "Enter your choice [0-3]: " choice
-case "$choice" in
-1) configure_tunnel ;;
-2) tunnel_management ;;
-3) check_tunnel_status ;;
-0) return ;;
-*) colorize red "Invalid option!"; sleep 1 ;;
-esac
-done
-}
-
-tunnel_manager_menu() {
-while true; do
-clear
-colorize cyan "Tunnel Manager" bold
-echo ""
-colorize green " 1. Backhaul" bold
-colorize green " 2. Rathole" bold
-echo " 0. Back"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-read -r -p "Enter your choice [0-2]: " choice
-case "$choice" in
-1) backhaul_menu ;;
-2) core_rathole_menu ;;
-0) return ;;
-*) colorize red "Invalid option!"; sleep 1 ;;
-esac
-done
-}
-
-check_all_tunnel_status() {
-check_tunnel_status
-core_rathole_check_status
-}
 
 run_watchdog_check() {
 core_backhaul_watchdog_check_all
@@ -181,27 +151,33 @@ display_logo
 display_server_info
 display_backhaul_core_status
 echo
-colorize green " 1. Tunnel Manager (Backhaul / Rathole)" bold
-colorize magenta " 2. GOST Manager" bold
+colorize green " 1. Configure a new tunnel" bold
+colorize red " 2. Tunnel management" bold
 colorize cyan " 3. Check tunnel status" bold
-echo " 4. Update Backhaul Core"
-echo " 5. Update script"
-echo " 6. Remove Backhaul Core"
-colorize red " 7. Uninstall everything" bold
+echo "──────────────────────────────────"
+colorize green " 4. Rathole" bold
+colorize magenta " 5. GOST Manager" bold
+echo "──────────────────────────────────"
+echo " 6. Update Backhaul Core"
+echo " 7. Update script"
+echo " 8. Remove Backhaul Core"
+colorize red " 9. Uninstall everything" bold
 echo " 0. Exit"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 read_option() {
-read -r -p "Enter your choice [0-7]: " choice
+read -r -p "Enter your choice [0-9]: " choice
 case $choice in
-1) tunnel_manager_menu ;;
-2) core_gost_menu ;;
-3) check_all_tunnel_status ;;
-4) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
-5) update_script ;;
-6) remove_core ;;
-7) uninstall_everything ;;
+1) configure_tunnel ;;
+2) tunnel_management ;;
+3) check_tunnel_status ;;
+4) core_rathole_menu ;;
+5) core_gost_menu ;;
+6) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
+7) update_script ;;
+8) remove_core ;;
+9) uninstall_everything ;;
 0) exit 0 ;;
 *) colorize red "Invalid option!" && sleep 1 ;;
 esac
