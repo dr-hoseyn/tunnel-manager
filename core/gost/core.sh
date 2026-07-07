@@ -135,6 +135,10 @@ rtcp|rudp) echo "listener" ;;
 esac
 }
 
+gost_detect_default_gateway() {
+ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}'
+}
+
 gost_meta_set() {
 local name="$1" key="$2" value="$3"
 local f="${GOST_META_DIR}/${name}.conf"
@@ -257,6 +261,40 @@ fi
 } > "$f"
 }
 
+# tun2socks: routes this server's own traffic through a chain (a remote
+# relay/socks5 service, built with the existing Services/Chains features) by
+# bringing up a TUN device and rewriting the default route through it. The
+# postUp sequence always re-adds the original default route at a higher
+# metric (10) before adding the tun route at metric 1 — GOST's own
+# documented pattern for this, not a panel invention — so if the tun
+# interface ever goes down, the kernel drops its route automatically and
+# traffic falls back to the original path with no manual cleanup needed.
+# GOST has no postDown hook to pair with postUp, which is exactly why this
+# fallback-route pattern matters: it's the only teardown safety net there is.
+gost_generate_tungo_fragment() {
+local name="$1" chain_name="$2" tun_net="$3" tun_mtu="$4" tun_dns="$5" gateway_ip="$6" gateway_iface="$7"
+local f="${GOST_SERVICES_DIR}/${name}.yaml"
+{
+echo "- name: ${name}"
+echo "  addr: \":0\""
+echo "  handler:"
+echo "    type: tungo"
+echo "    chain: ${chain_name}"
+echo "  listener:"
+echo "    type: tungo"
+echo "    metadata:"
+echo "      name: ${name}"
+echo "      net: \"${tun_net}\""
+echo "      mtu: ${tun_mtu}"
+[[ -n "$tun_dns" ]] && echo "      dns: ${tun_dns}"
+echo "  metadata:"
+echo "    postUp:"
+echo "    - ip route delete default"
+echo "    - ip route add default via ${gateway_ip} dev ${gateway_iface} metric 10"
+echo "    - ip route add default dev ${name} metric 1"
+} > "$f"
+}
+
 gost_generate_chain_fragment() {
 local name="$1" hops_file="$2"
 local f="${GOST_CHAINS_DIR}/${name}.yaml"
@@ -373,6 +411,69 @@ gost_generate_service_fragment "$name" "$handler_type" "$listener_type" "$addr" 
 gost_meta_set "$name" "handler_type" "$handler_type"
 gost_apply_and_restart
 echo ""
+press_key
+}
+
+core_gost_add_tungo() {
+core_gost_ensure_ready
+clear
+colorize cyan "GOST TUN2SOCKS — route this server's own traffic through a chain" bold
+echo ""
+colorize red "WARNING: this replaces this server's default route." bold
+colorize yellow "A fallback route at a higher metric is added automatically (GOST's own"
+colorize yellow "documented pattern), so losing the tun interface shouldn't drop"
+colorize yellow "connectivity — but this still changes system-wide routing. If you're not"
+colorize yellow "certain, test with your provider's console open, not only over SSH."
+echo ""
+
+local -a existing_chains=()
+mapfile -t existing_chains < <(core_gost_list_chains)
+if [[ "${#existing_chains[@]}" -eq 0 ]]; then
+colorize red "No chains exist yet. Create one first from GOST Manager -> Chains — it"
+colorize red "should point at a relay/socks5-type service on the remote server you want"
+colorize red "to route through."
+press_key
+return 1
+fi
+colorize magenta "Existing chains: ${existing_chains[*]}"
+local chain_name
+prompt_with_default "Chain to route through" "${existing_chains[0]}" chain_name
+if [[ ! -f "${GOST_CHAINS_DIR}/${chain_name}.yaml" ]]; then
+colorize red "No such chain '${chain_name}'."
+press_key
+return 1
+fi
+
+local gateway_ip gateway_iface
+gateway_ip=$(gost_detect_default_gateway)
+gateway_iface=$(detect_default_interface)
+if [[ -z "$gateway_ip" || -z "$gateway_iface" ]]; then
+colorize red "Could not auto-detect this server's current default gateway/interface —"
+colorize red "refusing to generate a routing change that can't be verified safe."
+press_key
+return 1
+fi
+echo ""
+colorize yellow "Detected current default route: via ${gateway_ip} dev ${gateway_iface} (kept as the fallback)"
+echo ""
+
+local name tun_net tun_mtu tun_dns
+prompt_with_default "TUN device name" "tungo0" name
+if [[ -f "${GOST_SERVICES_DIR}/${name}.yaml" ]]; then
+colorize red "A GOST service named '${name}' already exists."
+press_key
+return 1
+fi
+prompt_with_default "TUN network (CIDR)" "192.168.123.1/24" tun_net
+prompt_with_default "MTU" "1420" tun_mtu
+prompt_with_default "DNS server (optional)" "1.1.1.1" tun_dns
+
+gost_generate_tungo_fragment "$name" "$chain_name" "$tun_net" "$tun_mtu" "$tun_dns" "$gateway_ip" "$gateway_iface"
+gost_meta_set "$name" "handler_type" "tungo"
+gost_apply_and_restart
+echo ""
+colorize yellow "If this server becomes unreachable: use your provider's console to run"
+colorize yellow "'systemctl stop gost.service', then remove '${name}' from GOST Manager -> Services."
 press_key
 }
 
@@ -608,19 +709,21 @@ echo ""
 colorize green " 1. Quick Start (simple TCP/UDP forward)" bold
 colorize magenta " 2. Services (advanced)" bold
 colorize magenta " 3. Chains (protocol/transport chaining)" bold
-colorize cyan " 4. Diagnostics" bold
-echo " 5. View logs"
-echo " 6. Restart gost"
+colorize red " 4. TUN2SOCKS (route this server's traffic through a chain)" bold
+colorize cyan " 5. Diagnostics" bold
+echo " 6. View logs"
+echo " 7. Restart gost"
 echo " 0. Back"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-read -r -p "Enter your choice [0-6]: " choice
+read -r -p "Enter your choice [0-7]: " choice
 case "$choice" in
 1) core_gost_quick_start ;;
 2) core_gost_service_menu ;;
 3) core_gost_chain_menu ;;
-4) core_gost_diagnostics ;;
-5) view_service_logs "$GOST_SERVICE_NAME" ;;
-6) restart_service "$GOST_SERVICE_NAME" ;;
+4) core_gost_add_tungo ;;
+5) core_gost_diagnostics ;;
+6) view_service_logs "$GOST_SERVICE_NAME" ;;
+7) restart_service "$GOST_SERVICE_NAME" ;;
 0) return ;;
 *) colorize red "Invalid option!"; sleep 1 ;;
 esac

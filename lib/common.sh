@@ -215,6 +215,50 @@ rm -f "$FAIL2BAN_JAIL_FILE"
 systemctl restart fail2ban >/dev/null 2>&1
 colorize yellow "Fail2Ban SSH jail removed (Fail2Ban itself stays installed/running for any other jails on the system)."
 }
+cpu_usage_percent() {
+[[ -r /proc/stat ]] || { echo "NA"; return 1; }
+local -a f1 f2
+read -r -a f1 < /proc/stat
+sleep 0.3
+read -r -a f2 < /proc/stat
+local i total1=0 total2=0
+for ((i = 1; i < ${#f1[@]}; i++)); do total1=$((total1 + f1[i])); done
+for ((i = 1; i < ${#f2[@]}; i++)); do total2=$((total2 + f2[i])); done
+local idle1=$((f1[4] + f1[5])) idle2=$((f2[4] + f2[5]))
+local total_delta=$((total2 - total1)) idle_delta=$((idle2 - idle1))
+(( total_delta <= 0 )) && { echo "0"; return; }
+echo $(( (100 * (total_delta - idle_delta)) / total_delta ))
+}
+mem_usage_info() {
+[[ -r /proc/meminfo ]] || { echo "NA NA NA"; return 1; }
+local total avail
+total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+[[ -z "$total" || -z "$avail" || "$total" -le 0 ]] && { echo "NA NA NA"; return 1; }
+echo "$(( (total - avail) / 1024 )) $((total / 1024)) $(( (100 * (total - avail)) / total ))"
+}
+net_rate_kbps() {
+local iface="$1"
+[[ -r /proc/net/dev ]] || { echo "NA NA"; return 1; }
+local rx1 tx1 rx2 tx2
+read -r rx1 tx1 <<< "$(awk -v ifc="${iface}:" '$1==ifc{print $2, $10}' /proc/net/dev)"
+[[ -z "$rx1" ]] && { echo "NA NA"; return 1; }
+sleep 1
+read -r rx2 tx2 <<< "$(awk -v ifc="${iface}:" '$1==ifc{print $2, $10}' /proc/net/dev)"
+echo "$(( (rx2 - rx1) / 1024 )) $(( (tx2 - tx1) / 1024 ))"
+}
+count_tunnels_multi() {
+local dir="$1" prefix="$2" ext="$3"
+local total=0 active=0 f name svc
+for f in "${dir}"/iran*."${ext}" "${dir}"/kharej*."${ext}"; do
+[[ -f "$f" ]] || continue
+((total++))
+name=$(basename "${f%."${ext}"}")
+svc="${prefix}-${name}.service"
+systemctl is-active --quiet "$svc" 2>/dev/null && ((active++))
+done
+echo "$active $total"
+}
 persist_line_once() {
 local line="$1"
 local file="$2"

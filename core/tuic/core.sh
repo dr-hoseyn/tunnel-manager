@@ -11,10 +11,11 @@
 # github.com/Itsusinn/tuic instead — the actively maintained implementation
 # tuic-protocol/tuic's own README lists as a reference implementation, and
 # the only one publishing current server+client binaries together in one
-# release. That repo does not publish checksums for its releases, so
-# core_tuic_install has nothing to verify against beyond TLS — same
-# "warn and proceed" fallback the other cores use when a checksum is
-# unavailable, just always taken here rather than as a fallback.
+# release. That repo does not currently publish checksums, so installs are
+# unverified beyond TLS today — but tuic_try_verify_checksum() probes several
+# common checksum-file naming conventions on every install/update, so this
+# turns itself on automatically the moment upstream adds one, no code change
+# needed.
 #
 # Requires lib/common.sh and core/backhaul/core.sh to already be sourced
 # (shared write_tunnel_meta/read_tunnel_meta/write_tunnel_last_test/
@@ -58,6 +59,32 @@ core_tuic_install() {
 core_tuic_download_binaries
 }
 
+# Itsusinn/tuic publishes no checksums today, but tries several common
+# per-asset/combined naming conventions each install/update so verification
+# turns on by itself the moment upstream adds any of them — no code change
+# needed later. Echoes "verified" (hash matched), "mismatch" (hash present
+# but wrong — caller should abort), or "unavailable" (no checksum file found
+# under any of the tried names).
+tuic_try_verify_checksum() {
+local file="$1" asset_name="$2" tag="$3"
+local candidate url content expected actual
+for candidate in "${asset_name}.sha256sum" "${asset_name}.sha256" "checksums.txt" "SHA256SUMS" "sha256sum.txt"; do
+url="https://github.com/${TUIC_REPO}/releases/download/${tag}/${candidate}"
+content=$(curl -fsSL "$url" 2>/dev/null)
+[[ -z "$content" ]] && continue
+expected=$(grep -F "$asset_name" <<< "$content" | awk '{print $1}' | head -1)
+[[ -z "$expected" ]] && expected=$(awk '{print $1}' <<< "$content" | head -1)
+[[ -z "$expected" ]] && continue
+actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+if [[ "$actual" == "$expected" ]]; then
+echo "verified"
+else
+echo "mismatch"
+fi
+return 0
+done
+echo "unavailable"
+}
 tuic_generate_uuid() {
 if [[ -r /proc/sys/kernel/random/uuid ]]; then
 cat /proc/sys/kernel/random/uuid
@@ -107,7 +134,26 @@ rm -rf "$tmp_dir"
 press_key
 return 1
 fi
-colorize yellow "Note: upstream does not publish checksums for this release; installing unverified over HTTPS."
+local server_check client_check
+server_check=$(tuic_try_verify_checksum "${tmp_dir}/tuic-server" "tuic-server-${asset_arch}-linux" "$tag")
+if [[ "$server_check" == "mismatch" ]]; then
+colorize red "Checksum verification failed for tuic-server! Refusing to install."
+rm -rf "$tmp_dir"
+press_key
+return 1
+fi
+client_check=$(tuic_try_verify_checksum "${tmp_dir}/tuic-client" "tuic-client-${asset_arch}-linux" "$tag")
+if [[ "$client_check" == "mismatch" ]]; then
+colorize red "Checksum verification failed for tuic-client! Refusing to install."
+rm -rf "$tmp_dir"
+press_key
+return 1
+fi
+if [[ "$server_check" == "verified" && "$client_check" == "verified" ]]; then
+colorize green "✔ Checksums verified."
+else
+colorize yellow "Note: upstream does not currently publish checksums for this release; installing unverified over HTTPS."
+fi
 chmod +x "${tmp_dir}/tuic-server" "${tmp_dir}/tuic-client"
 if ! "${tmp_dir}/tuic-server" --help &> /dev/null || ! "${tmp_dir}/tuic-client" --help &> /dev/null; then
 colorize red "Downloaded TUIC binaries failed a basic sanity check (--help)."

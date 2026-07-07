@@ -154,6 +154,52 @@ colorize green "Done. Goodbye."
 exit 0
 }
 
+# Sampling (cpu_usage_percent + net_rate_kbps) blocks for ~1.3s per refresh
+# by design — this reads /proc directly rather than running a background
+# daemon, which is the right tradeoff for a terminal panel but means this
+# is refresh-every-few-seconds, not truly real-time.
+dashboard_view() {
+while true; do
+clear
+colorize cyan "Live Dashboard" bold
+echo "$(date '+%Y-%m-%d %H:%M:%S')"
+echo ""
+local cpu mem_used mem_total mem_pct
+cpu=$(cpu_usage_percent)
+read -r mem_used mem_total mem_pct <<< "$(mem_usage_info)"
+echo -e "\033[36mCPU:\033[0m ${cpu}%"
+echo -e "\033[36mRAM:\033[0m ${mem_used}MB / ${mem_total}MB (${mem_pct}%)"
+local iface rx tx
+iface=$(detect_default_interface)
+if [[ -n "$iface" ]]; then
+read -r rx tx <<< "$(net_rate_kbps "$iface")"
+echo -e "\033[36mNetwork (${iface}):\033[0m down ${rx} KB/s / up ${tx} KB/s"
+fi
+echo ""
+colorize blue "── Tunnels ──" bold
+local a t
+read -r a t <<< "$(count_tunnels_multi "$config_dir" "backhaul" "toml")"
+echo "Backhaul:  ${a}/${t} active"
+read -r a t <<< "$(count_tunnels_multi "$RATHOLE_DIR" "rathole" "toml")"
+echo "Rathole:   ${a}/${t} active"
+read -r a t <<< "$(count_tunnels_multi "$HYSTERIA2_DIR" "hysteria2" "yaml")"
+echo "Hysteria2: ${a}/${t} active"
+read -r a t <<< "$(count_tunnels_multi "$FRP_DIR" "frp" "toml")"
+echo "FRP:       ${a}/${t} active"
+read -r a t <<< "$(count_tunnels_multi "$TUIC_DIR" "tuic" "toml")"
+echo "TUIC:      ${a}/${t} active"
+local gost_status gost_entities
+if systemctl is-active --quiet "$GOST_SERVICE_NAME" 2>/dev/null; then gost_status="active"; else gost_status="inactive"; fi
+gost_entities=$(( $(core_gost_list_services | grep -c .) + $(core_gost_list_chains | grep -c .) ))
+echo "GOST:      ${gost_status} (${gost_entities} services+chains configured)"
+echo ""
+echo "Auto-refreshing every 5s — press 0 to go back"
+local key
+read -r -t 5 -n 1 -s key
+[[ "$key" == "0" ]] && return
+done
+}
+
 security_maintenance_menu() {
 while true; do
 clear
@@ -236,18 +282,19 @@ colorize yellow " 6. Hysteria2 (QUIC, DPI/throttling resistant)" bold
 colorize blue " 7. FRP" bold
 colorize magenta " 8. TUIC (QUIC, lightweight alternative)" bold
 echo "──────────────────────────────────"
-colorize blue " 9. Security & Maintenance (TLS cert, Fail2Ban)" bold
+colorize green " 9. Dashboard (live CPU/RAM/network + tunnel status)" bold
+colorize blue "10. Security & Maintenance (TLS cert, Fail2Ban)" bold
 echo "──────────────────────────────────"
-echo "10. Update Backhaul Core"
-echo "11. Update script"
-echo "12. Remove Backhaul Core"
-colorize red "13. Uninstall everything" bold
+echo "11. Update Backhaul Core"
+echo "12. Update script"
+echo "13. Remove Backhaul Core"
+colorize red "14. Uninstall everything" bold
 echo " 0. Exit"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 read_option() {
-read -r -p "Enter your choice [0-13]: " choice
+read -r -p "Enter your choice [0-14]: " choice
 case $choice in
 1) core_backhaul_configure ;;
 2) core_backhaul_manage ;;
@@ -257,11 +304,12 @@ case $choice in
 6) core_hysteria2_menu ;;
 7) core_frp_menu ;;
 8) core_tuic_menu ;;
-9) security_maintenance_menu ;;
-10) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
-11) update_script ;;
-12) remove_core ;;
-13) uninstall_everything ;;
+9) dashboard_view ;;
+10) security_maintenance_menu ;;
+11) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
+12) update_script ;;
+13) remove_core ;;
+14) uninstall_everything ;;
 0) exit 0 ;;
 *) colorize red "Invalid option!" && sleep 1 ;;
 esac
