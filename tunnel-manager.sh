@@ -34,6 +34,8 @@ source "${INSTALL_DIR}/lib/common.sh"
 source "${INSTALL_DIR}/core/backhaul/core.sh"
 # shellcheck source=core/rathole/core.sh
 source "${INSTALL_DIR}/core/rathole/core.sh"
+# shellcheck source=core/gost/core.sh
+source "${INSTALL_DIR}/core/gost/core.sh"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 SERVER_COUNTRY=$(curl -sS --max-time 1 "http://ipwhois.app/json/$SERVER_IP" 2>/dev/null | jq -r '.country' 2>/dev/null)
@@ -80,15 +82,6 @@ esac
 done
 }
 
-gost_manager_menu() {
-clear
-colorize cyan "GOST Manager" bold
-echo ""
-colorize yellow "Not built yet — coming in a later update."
-echo ""
-press_key
-}
-
 check_all_tunnel_status() {
 check_tunnel_status
 core_rathole_check_status
@@ -97,6 +90,7 @@ core_rathole_check_status
 run_watchdog_check() {
 core_backhaul_watchdog_check_all
 core_rathole_watchdog_check_all
+core_gost_watchdog_check
 }
 
 uninstall_everything() {
@@ -106,7 +100,7 @@ colorize red "  FULL UNINSTALL — THIS IS DESTRUCTIVE" bold
 colorize red "═══════════════════════════════════════" bold
 echo ""
 echo "This will:"
-echo "  - Stop and remove every configured tunnel (Backhaul and Rathole) and their firewall/forwarding rules"
+echo "  - Stop and remove every configured tunnel (Backhaul, Rathole, GOST) and their firewall/forwarding rules"
 echo "  - Remove the watchdog timer"
 echo "  - Remove the journald size-limit and sysctl (ip_forward/rp_filter) drop-ins"
 echo "  - Remove any HAProxy/IPVS config this panel created (not the packages themselves)"
@@ -127,6 +121,8 @@ colorize yellow "Removing all Backhaul tunnels..."
 core_backhaul_destroy_all
 colorize yellow "Removing all Rathole tunnels..."
 core_rathole_destroy_all
+colorize yellow "Removing GOST..."
+core_gost_destroy_all
 colorize yellow "Removing watchdog timer..."
 systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1
 rm -f "${service_dir}/backhaul-watchdog.timer" "${service_dir}/backhaul-watchdog.service"
@@ -200,7 +196,7 @@ read_option() {
 read -r -p "Enter your choice [0-7]: " choice
 case $choice in
 1) tunnel_manager_menu ;;
-2) gost_manager_menu ;;
+2) core_gost_menu ;;
 3) check_all_tunnel_status ;;
 4) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
 5) update_script ;;
