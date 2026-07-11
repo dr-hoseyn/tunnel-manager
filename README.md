@@ -15,6 +15,7 @@ This isn't a wrapper around one tool. Each engine is a self-contained module (`c
 - [Security](#security)
 - [Backups](#backups)
 - [Health monitoring](#health-monitoring)
+- [Network optimization](#network-optimization)
 - [Migrating to a new VPS](#migrating-to-a-new-vps)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
@@ -81,12 +82,14 @@ The panel runs diagnostics automatically right after each side is configured, an
 7. FRP
 8. TUIC (QUIC, lightweight alternative)
 ──────────────────────────────────
-9. Security & Maintenance (TLS cert, Fail2Ban)
+9. Dashboard (live CPU/RAM/network + tunnel status)
+10. Security & Maintenance (TLS cert, Fail2Ban)
+11. Optimize Network (BBR, buffers, conntrack, port reservation)
 ──────────────────────────────────
-10. Update Backhaul Core
-11. Update script
-12. Remove Backhaul Core
-13. Uninstall everything
+12. Update Backhaul Core
+13. Update script
+14. Remove Backhaul Core
+15. Uninstall everything
 0. Exit
 ```
 
@@ -136,6 +139,21 @@ Editing or updating a tunnel automatically snapshots the current config + system
 ## Health monitoring
 
 A systemd timer (`backhaul-watchdog.timer`) runs every 5 minutes and, per engine, restarts any tunnel service that should be running but isn't. It also renews the shared TLS cert when needed (see [Security](#security)). This installs automatically the first time you configure any tunnel — there's nothing to turn on separately.
+
+## Network optimization
+
+**Optimize Network** (menu item 11) tunes the underlying OS/kernel network stack — this is independent of, and complementary to, each engine's own tuning options (e.g. Backhaul's `so_rcvbuf`/`so_sndbuf`/`mss`/mux settings). It applies:
+
+- Larger socket buffers (`rmem`/`wmem`, max *and* default), backlog, and connection-capacity sysctls sized for holding many concurrent tunnel connections.
+- BBR + `fq` where the kernel supports it — persisted across reboots (`/etc/modules-load.d`) and applied immediately to already-up interfaces via `tc qdisc replace` (`net.core.default_qdisc` alone only affects newly-created interfaces).
+- Connection-tracking tuning (`nf_conntrack_max`/hashsize) when the kernel/namespace exposes it — tolerated, not fatal, on containers (OpenVZ/LXC) where it doesn't.
+- Ephemeral-port reservation: every port already in `LISTEN` state (across every engine, not just Backhaul) is added to `net.ipv4.ip_local_reserved_ports`, so the deliberately wide ephemeral range this panel needs for high concurrency never gets handed out as an outgoing port that collides with a tunnel's own bind port. This is a snapshot taken at apply time — re-run it after configuring a new tunnel/port.
+- TCP keepalive tuning for long-lived tunnel connections, `tcp_fastopen`, `tcp_no_metrics_save`.
+- A systemd `DefaultLimitNOFILE` drop-in for services *other* than this panel's tunnels — every engine here already sets `LimitNOFILE=1048576` on its own systemd unit, so this only matters for unrelated services on the box.
+
+Every run snapshots the prior state into `/root/backhaul-core/.backups/network-tune.<timestamp>/`, and **Roll back** in the same menu removes everything it added. Uninstalling everything also rolls this back automatically if it was ever applied.
+
+This is the same tuning as the standalone [vm-network-tuner](https://github.com/dr-hoseyn/vm-network-tuner) script, wired into this panel's menu/backup conventions instead of being a separate one-shot script.
 
 ## Migrating to a new VPS
 

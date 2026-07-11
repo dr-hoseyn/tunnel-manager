@@ -29,6 +29,8 @@ fi
 # resolving lib/core relative to that would look in /usr/local/bin and miss.
 # shellcheck source=lib/common.sh
 source "${INSTALL_DIR}/lib/common.sh"
+# shellcheck source=lib/network_tune.sh
+source "${INSTALL_DIR}/lib/network_tune.sh"
 # shellcheck source=core/backhaul/core.sh
 source "${INSTALL_DIR}/core/backhaul/core.sh"
 # shellcheck source=core/rathole/core.sh
@@ -149,6 +151,7 @@ echo "This will:"
 echo "  - Stop and remove every configured tunnel (Backhaul, Rathole, GOST, Hysteria2, FRP, TUIC) and their firewall/forwarding rules"
 echo "  - Remove the watchdog timer"
 echo "  - Remove the journald size-limit and sysctl (ip_forward/rp_filter) drop-ins"
+echo "  - Remove the network-optimize sysctl/module-load/systemd drop-ins, if applied"
 echo "  - Remove any HAProxy/IPVS/Fail2Ban config this panel created (not the packages themselves)"
 echo "  - Delete ${config_dir} (all configs, certs, backups, both cores' binaries)"
 echo "  - Delete this panel (${INSTALL_DIR}, ${PANEL_PATH}, ${TUNNEL_MANAGER_PATH})"
@@ -186,6 +189,10 @@ rm -f /etc/systemd/journald.conf.d/backhaul-tunnel.conf
 systemctl restart systemd-journald >/dev/null 2>&1
 rm -f /etc/sysctl.d/99-backhaul-tunnel.conf
 rm -f /etc/modules-load.d/backhaul-tunnel.conf
+if core_optimize_is_applied || [[ -f "$NETTUNE_BBR_MODULE_CONF" ]]; then
+colorize yellow "Rolling back network optimization..."
+core_optimize_rollback >/dev/null 2>&1
+fi
 colorize yellow "Removing config directory..."
 rm -rf "$config_dir"
 colorize green "✔ Everything removed."
@@ -279,6 +286,36 @@ esac
 done
 }
 
+network_optimize_menu() {
+while true; do
+clear
+colorize cyan "Optimize Network" bold
+echo ""
+if core_optimize_is_applied; then
+echo "Status: applied"
+echo "Congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a)"
+else
+echo "Status: not applied"
+fi
+echo ""
+echo "Tunes buffers/backlog/conntrack, enables BBR+fq where supported, and"
+echo "reserves this box's currently-listening ports out of the ephemeral"
+echo "port range so they never collide with it."
+echo ""
+colorize green " 1. Apply / re-apply optimization" bold
+colorize red " 2. Roll back" bold
+echo " 0. Back"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+read -r -p "Enter your choice [0-2]: " choice
+case "$choice" in
+1) core_optimize_apply; press_key ;;
+2) core_optimize_rollback; press_key ;;
+0) return ;;
+*) colorize red "Invalid option!"; sleep 1 ;;
+esac
+done
+}
+
 update_script() {
 colorize yellow "Updating Tunnel Manager..."
 local tmp_dir
@@ -328,17 +365,18 @@ colorize magenta " 8. TUIC (QUIC, lightweight alternative)" bold
 echo "──────────────────────────────────"
 colorize green " 9. Dashboard (live CPU/RAM/network + tunnel status)" bold
 colorize blue "10. Security & Maintenance (TLS cert, Fail2Ban)" bold
+colorize blue "11. Optimize Network (BBR, buffers, conntrack, port reservation)" bold
 echo "──────────────────────────────────"
-echo "11. Update Backhaul Core"
-echo "12. Update script"
-echo "13. Remove Backhaul Core"
-colorize red "14. Uninstall everything" bold
+echo "12. Update Backhaul Core"
+echo "13. Update script"
+echo "14. Remove Backhaul Core"
+colorize red "15. Uninstall everything" bold
 echo " 0. Exit"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 read_option() {
-read -r -p "Enter your choice [0-14]: " choice
+read -r -p "Enter your choice [0-15]: " choice
 case $choice in
 1) core_backhaul_configure ;;
 2) core_backhaul_manage ;;
@@ -350,10 +388,11 @@ case $choice in
 8) core_tuic_menu ;;
 9) dashboard_view ;;
 10) security_maintenance_menu ;;
-11) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
-12) update_script ;;
-13) remove_core ;;
-14) uninstall_everything ;;
+11) network_optimize_menu ;;
+12) core_backhaul_ensure_ready; download_and_extract_backhaul "menu" ;;
+13) update_script ;;
+14) remove_core ;;
+15) uninstall_everything ;;
 0) exit 0 ;;
 *) colorize red "Invalid option!" && sleep 1 ;;
 esac
