@@ -68,6 +68,12 @@ cooldown, bounded-step, A/B confirmation, and rollback gates intact when
 changing the policy; they prevent unrelated network failures from being
 misdiagnosed as MTU failures.
 
+TUN/IPX health telemetry and root-cause classification live in
+`lib/tunnel_health.sh`. The latest snapshot is replaced atomically and its TSV
+history is bounded. The classifier is also a safety dependency of Auto-MTU:
+new classifications must fail closed unless they positively identify a state
+where MTU probing remains safe.
+
 Each core also picks its own config format/tooling depending on what the
 upstream engine actually speaks and what's verifiable against real upstream
 docs/source — don't force a common format:

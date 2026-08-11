@@ -22,6 +22,8 @@ AUTOMTU_SETTLE_SECONDS=0
 
 # shellcheck source=../lib/common.sh
 source "${ROOT_DIR}/lib/common.sh"
+# shellcheck source=../lib/tunnel_health.sh
+source "${ROOT_DIR}/lib/tunnel_health.sh"
 # shellcheck source=../lib/auto_mtu.sh
 source "${ROOT_DIR}/lib/auto_mtu.sh"
 # shellcheck source=../core/backhaul/core.sh
@@ -39,6 +41,13 @@ show) return 1 ;;
 esac
 }
 logger() { :; }
+tunnel_health_ensure_fresh() { return 0; }
+HEALTH_GATE_STATUS=0
+tunnel_health_automtu_gate() {
+if (( HEALTH_GATE_STATUS == 0 )); then HEALTH_GATE_REASON="healthy"; return 0; fi
+HEALTH_GATE_REASON="health-class-network-congestion"
+return 1
+}
 
 write_ipx_config() {
 local path="$1" mtu="$2" name="$3"
@@ -132,6 +141,16 @@ automtu_reset_learning "$name"
 APPLY_COUNT=0
 ROLLBACK_COUNT=0
 TRAFFIC_STATUS=1
+HEALTH_GATE_STATUS=0
+}
+
+test_health_classifier_blocks_mtu_changes() {
+prepare_scenario healthblock
+PING_SCENARIO=up_good
+HEALTH_GATE_STATUS=1
+automtu_run_locked "$CURRENT_CONFIG" manual
+assert_eq "$APPLY_COUNT" 0
+assert_eq "$(automtu_state_get "${AUTOMTU_STATE_DIR}/healthblock.state" last_skip none)" health-class-network-congestion
 }
 
 test_unsafe_observation_windows_are_ignored() {
@@ -209,6 +228,7 @@ esac
 
 test_settings_and_scoped_update
 test_metric_guards
+test_health_classifier_blocks_mtu_changes
 test_unsafe_observation_windows_are_ignored
 test_watchdog_requires_repeated_evidence
 test_non_mtu_problem_is_ignored

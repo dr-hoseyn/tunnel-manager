@@ -14,6 +14,8 @@ mkdir -p "$config_dir" "$service_dir"
 
 # shellcheck source=../lib/common.sh
 source "${ROOT_DIR}/lib/common.sh"
+# shellcheck source=../lib/tunnel_health.sh
+source "${ROOT_DIR}/lib/tunnel_health.sh"
 # shellcheck source=../lib/auto_mtu.sh
 source "${ROOT_DIR}/lib/auto_mtu.sh"
 # shellcheck source=../core/backhaul/core.sh

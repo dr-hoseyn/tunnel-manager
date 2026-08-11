@@ -133,7 +133,7 @@ automtu_system_load_ok() {
 local load_one cpu_count
 read -r load_one _ < /proc/loadavg || return 1
 cpu_count=$(nproc 2>/dev/null || printf '1')
-awk -v load="$load_one" -v cpus="$cpu_count" 'BEGIN { exit !(load <= cpus * 1.5) }'
+awk -v load_value="$load_one" -v cpus="$cpu_count" 'BEGIN { exit !(load_value <= cpus * 1.5) }'
 }
 
 automtu_service_bytes() {
@@ -283,6 +283,18 @@ remote_ip=$(toml_get "$config_path" tun remote_addr); remote_ip="${remote_ip%/*}
 service_should_run "$service_name" && automtu_service_stable "$service_name" || { automtu_record_skip "$state_file" "service-not-stable"; return 0; }
 iface_mtu=$(automtu_iface_mtu "$tun_name")
 [[ "$iface_mtu" == "$current" ]] || { automtu_record_skip "$state_file" "interface-config-mismatch"; return 0; }
+if declare -F tunnel_health_ensure_fresh &>/dev/null; then
+if ! tunnel_health_ensure_fresh "$config_path"; then
+automtu_record_skip "$state_file" "health-collection-failed"
+automtu_note "$mode" yellow "Auto-MTU skipped: tunnel health telemetry could not be collected safely."
+return 0
+fi
+if ! tunnel_health_automtu_gate "$config_path"; then
+automtu_record_skip "$state_file" "$HEALTH_GATE_REASON"
+automtu_note "$mode" yellow "Auto-MTU skipped by Tunnel Health: ${HEALTH_GATE_REASON}."
+return 0
+fi
+fi
 automtu_system_load_ok || { automtu_record_skip "$state_file" "system-load-high"; return 0; }
 local traffic_status
 if automtu_service_is_busy "$service_name"; then traffic_status=0; else traffic_status=$?; fi

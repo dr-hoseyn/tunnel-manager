@@ -429,7 +429,7 @@ systemctl daemon-reload
 systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
 }
 core_backhaul_watchdog_check_all() {
-local config_path config_name service_name is_tun tun_name
+local config_path config_name service_name is_tun is_ipx tun_name
 for config_path in "${config_dir}"/{iran,kharej}*.toml; do
 [[ -f "$config_path" ]] || continue
 config_name=$(basename "${config_path%.toml}")
@@ -437,7 +437,9 @@ service_name="backhaul-${config_name}.service"
 if ! service_should_run "$service_name"; then
 continue
 fi
+is_ipx="false"; tunnel_is_ipx "$config_path" && is_ipx="true"
 if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
+[[ "$is_ipx" == "true" ]] && tunnel_health_run "$config_path" watchdog || true
 watchdog_restart_if_enabled "$service_name" "backhaul-watchdog"
 continue
 fi
@@ -445,11 +447,13 @@ is_tun="false"; tunnel_is_tun "$config_path" && is_tun="true"
 if [[ "$is_tun" == "true" ]]; then
 tun_name=$(toml_tun_name "$config_path")
 if [[ -n "$tun_name" ]] && ! tun_iface_exists "$tun_name"; then
+[[ "$is_ipx" == "true" ]] && tunnel_health_run "$config_path" watchdog || true
 logger -t backhaul-watchdog "${service_name} TUN interface ${tun_name} is down, restarting" 2>/dev/null
 systemctl restart "$service_name" 2>/dev/null
 continue
 fi
-if tunnel_is_ipx "$config_path"; then
+if [[ "$is_ipx" == "true" ]]; then
+tunnel_health_run "$config_path" watchdog || true
 automtu_run "$config_path" watchdog || true
 fi
 fi
@@ -1921,6 +1925,11 @@ write_tunnel_meta "$new_config_name" "$peer_ip_for_meta" "${CONFIG[peer_ssh_port
 create_systemd_service "$prefix" "$new_port" "$new_config_path" || apply_ok="false"
 fi
 if [[ "$apply_ok" == "true" ]] && systemctl is-active --quiet "$new_service_name"; then
+if [[ "$new_config_name" == "$config_name" ]]; then
+tunnel_health_invalidate "$new_config_name" 2>/dev/null || true
+else
+tunnel_health_delete "$new_config_name" 2>/dev/null || true
+fi
 if [[ "$is_ipx" == "true" ]]; then
 automtu_save_settings "$new_config_name" "${CONFIG[smart_auto_mtu]:-false}" "${CONFIG[smart_mtu_min]:-$AUTOMTU_DEFAULT_MIN}" "${CONFIG[smart_mtu_max]:-$AUTOMTU_DEFAULT_MAX}" "${CONFIG[smart_mtu_step]:-$AUTOMTU_DEFAULT_STEP}"
 automtu_reset_learning "$new_config_name"
@@ -1929,6 +1938,7 @@ automtu_delete_state "$new_config_name" 2>/dev/null || true
 fi
 if [[ "$new_config_name" != "$config_name" ]]; then
 automtu_delete_state "$config_name" 2>/dev/null || true
+tunnel_health_delete "$config_name" 2>/dev/null || true
 fi
 colorize green "✔ Changes applied successfully; service is healthy."
 rm -rf "$backup_dir"
@@ -2130,6 +2140,53 @@ esac
 done
 }
 
+tunnel_health_menu() {
+local config_path="$1" config_name choice result health_class health_confidence health_reason
+config_name=$(basename "${config_path%.toml}")
+if ! tunnel_is_tun "$config_path" || ! tunnel_is_ipx "$config_path"; then
+colorize red "Tunnel Health classification is available only for Backhaul TUN/IPX tunnels."
+press_key
+return 1
+fi
+while true; do
+clear
+colorize cyan "Tunnel Health: ${config_name}" bold
+echo ""
+echo "Summary: $(tunnel_health_summary "$config_name")"
+echo ""
+tunnel_health_show_latest "$config_name" || true
+echo ""
+colorize cyan "1) Collect a fresh health sample"
+echo "2) View recent history"
+echo "0) Back"
+echo ""
+read -r -p "Choice: " choice
+case "$choice" in
+1)
+colorize yellow "Collecting control-path and system telemetry..."
+result=$(tunnel_health_run "$config_path" manual)
+IFS='|' read -r health_class health_confidence health_reason <<< "$result"
+if [[ -n "$health_class" ]]; then
+colorize green "Classification: ${health_class} (${health_confidence}%) — ${health_reason}"
+else
+colorize red "Health collection failed."
+fi
+press_key
+;;
+2)
+clear
+colorize cyan "Recent Tunnel Health history: ${config_name}" bold
+echo ""
+tunnel_health_show_history "$config_name" 24
+echo ""
+press_key
+;;
+0) return ;;
+*) colorize red "Invalid choice"; sleep 1 ;;
+esac
+done
+}
+
 tunnel_detail_page() {
 local config_path="$1"
 local config_name service_name role transport ipx_profile peer_ip last_test last_time ports_count
@@ -2153,6 +2210,7 @@ IFS='|' read -r last_test last_time <<< "$(read_tunnel_last_test "$config_name")
 echo "Last test: ${last_test} (${last_time})"
 echo "Tunnel type: ${transport}${ipx_profile:+ / ipx:$ipx_profile}"
 if [[ -n "$ipx_profile" ]]; then
+echo "Tunnel Health: $(tunnel_health_summary "$config_name")"
 echo "Smart Auto-MTU: $(automtu_status_text "$config_name" "$(toml_get "$config_path" tun mtu)")"
 fi
 echo "Role: $([[ "$role" == "server" ]] && echo "IRAN (Server)" || echo "KHAREJ (Client)")"
@@ -2177,6 +2235,7 @@ echo "5) View service status"
 colorize yellow "6) Restart service"
 colorize red "7) Remove this tunnel"
 colorize cyan "8) Smart Auto-MTU"
+colorize cyan "9) Tunnel Health"
 echo "0) Back"
 echo ""
 read -r -p "Choice: " choice
@@ -2189,6 +2248,7 @@ case "$choice" in
 6) restart_service "$service_name" ;;
 7) destroy_tunnel "$config_path"; return ;;
 8) smart_auto_mtu_menu "$config_path" ;;
+9) tunnel_health_menu "$config_path" ;;
 0) return ;;
 *) colorize red "Invalid choice"; sleep 1 ;;
 esac
@@ -2207,6 +2267,7 @@ removed_forwarder=$(toml_get "$config_path" "ports" "forwarder")
 removed_mapping=$(load_toml_ports_mapping "$config_path")
 removed_tun_remote_addr=$(toml_get "$config_path" "tun" "remote_addr")
 automtu_delete_state "$config_name" 2>/dev/null || true
+tunnel_health_delete "$config_name" 2>/dev/null || true
 tm_firewall_close_owner "backhaul:${config_name}"
 tm_firewall_close_owner "backhaul:${config_name}:control"
 if [[ -n "$removed_forwarder" && "$removed_forwarder" != "backhaul" ]]; then

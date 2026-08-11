@@ -15,6 +15,7 @@ This isn't a wrapper around one tool. Each engine is a self-contained module (`c
 - [Security](#security)
 - [Backups](#backups)
 - [Health monitoring](#health-monitoring)
+- [Tunnel Health engine](#tunnel-health-engine)
 - [Smart Auto-MTU for TUN/IPX](#smart-auto-mtu-for-tunipx)
 - [Network optimization](#network-optimization)
 - [Migrating to a new VPS](#migrating-to-a-new-vps)
@@ -141,6 +142,14 @@ Backhaul editing snapshots the config + systemd unit under `/root/backhaul-core/
 
 A systemd timer (`backhaul-watchdog.timer`) runs every 5 minutes and restarts an inactive tunnel only when its unit is enabled. A deliberately disabled tunnel stays disabled. It also checks the shared TLS certificate and restarts only enabled dependents when replacement is genuinely required.
 
+## Tunnel Health engine
+
+Every enabled Backhaul TUN/IPX tunnel receives a bounded health sample during the five-minute watchdog cycle. The engine correlates small and near-MTU control probes with TUN/physical-interface counters, qdisc drops, service traffic/CPU/memory/restarts, normalized system load, and conntrack utilization. Linux exposes the interface counters through `ip`/sysfs and driver statistics through `ethtool`; see the [kernel interface-statistics guide](https://docs.kernel.org/networking/statistics.html).
+
+The classifier reports one conservative cause with a confidence score: `healthy`, `mtu-suspected`, `network-congestion`, `physical-interface-drops`, `tunnel-interface-drops`, `cpu-saturation`, `memory-pressure`, `conntrack-pressure`, `service-restarting`, `service-failure`, `tunnel-interface-down`, `tunnel-path-failure`, or `peer-or-underlay-unreachable`. Missing underlay ICMP is never treated as definitive proof that the peer is down.
+
+Open **Tunnel management > Tunnel Health** to collect a fresh sample, inspect all current metrics, or view recent history. Per-tunnel state lives under `/root/backhaul-core/.health/`; history is capped at 288 samples (24 hours at the default interval). Smart Auto-MTU requires a sample no older than two minutes, fails closed on stale telemetry, and proceeds only when the current classification is `healthy` or `mtu-suspected`, preventing CPU, congestion, conntrack, service, and interface faults from being misdiagnosed as MTU problems.
+
 ## Smart Auto-MTU for TUN/IPX
 
 Backhaul TUN/IPX tunnels can opt into a bounded adaptive MTU controller. New IPX configurations are prompted for an initial MTU, minimum, maximum, and step; existing tunnels stay disabled until enabled from **Tunnel management > Smart Auto-MTU** or a full edit.
@@ -175,6 +184,7 @@ There's no one-click export yet (see [Roadmap](#roadmap)). Today, moving a worki
 - `/root/backhaul-core/cert_files/` if the tunnel uses TLS.
 - `/root/backhaul-core/.meta/<config_name>.meta` for the peer IP/SSH port diagnostics remember.
 - `/root/backhaul-core/.auto-mtu/` if you want to preserve learned TUN/IPX MTU bounds/history (optional; settings can be recreated from Edit).
+- `/root/backhaul-core/.health/` if you want to preserve the latest TUN/IPX diagnosis and its bounded 24-hour history (optional).
 
 Then re-run that engine's **Edit** flow once on the new server so the systemd service gets (re)created correctly, rather than hand-writing the unit file.
 
