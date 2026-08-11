@@ -2160,7 +2160,7 @@ done
 }
 core_backhaul_ensure_ready() {
 install_jq
-download_and_extract_backhaul
+download_and_extract_backhaul "install"
 check_config_backup
 }
 core_backhaul_configure() {
