@@ -191,6 +191,39 @@ assert_eq "${CONFIG[peer_ssh_port]}" '2222'
 assert_eq "${CONFIG[smart_auto_mtu]}" 'true'
 }
 
+test_edit_tun_conflicts_exclude_current_config() {
+local current_config="${config_dir}/iran1234.toml"
+local other_config="${config_dir}/iran5678.toml"
+cat > "$current_config" <<'EOF'
+[tun]
+name = "backhaul"
+local_addr = "10.10.10.1/24"
+remote_addr = "10.10.10.2/24"
+EOF
+cat > "$other_config" <<'EOF'
+[tun]
+name = "backhaul2"
+local_addr = "10.10.20.1/24"
+remote_addr = "10.10.20.2/24"
+EOF
+
+is_tun_name_in_use 'backhaul' || fail "current TUN name was not detected without an exclusion"
+! is_tun_name_in_use 'backhaul' "$current_config" || fail "edit treated the current TUN name as a conflict"
+is_tun_name_in_use 'backhaul2' "$current_config" || fail "edit missed another tunnel's TUN name"
+
+is_tun_subnet_in_use '10.10.10.99/24' || fail "current TUN subnet was not detected without an exclusion"
+! is_tun_subnet_in_use '10.10.10.99/24' "$current_config" || fail "edit treated the current TUN subnet as a conflict"
+is_tun_subnet_in_use '10.10.20.99/24' "$current_config" || fail "edit missed another tunnel's TUN subnet"
+
+is_tunnel_port_in_use server 1234 || fail "current health port was not detected without an exclusion"
+! is_tunnel_port_in_use server 1234 "$current_config" || fail "edit treated the current health port as a conflict"
+is_tunnel_port_in_use server 5678 "$current_config" || fail "edit missed another tunnel's health port"
+
+grep -qF 'prompt_tun_section "${CONFIG[transport_type]}" "$mode" "$is_ipx" "$config_path"' "${ROOT_DIR}/core/backhaul/core.sh" ||
+fail "full edit does not pass the current config to TUN conflict validation"
+rm -f "$current_config" "$other_config"
+}
+
 test_backup_restores_metadata() {
 local config_path="${TEST_ROOT}/edit.toml" service_path="${TEST_ROOT}/edit.service"
 local meta_path backup_dir
@@ -242,6 +275,7 @@ test_watchdog_respects_disable
 test_edit_restarts_active_service
 test_edit_cancel_keeps_live_config
 test_edit_load_uses_live_identity_and_mtu
+test_edit_tun_conflicts_exclude_current_config
 test_backup_restores_metadata
 test_optimize_exact_rollback
 printf 'All tunnel-manager core tests passed.\n'

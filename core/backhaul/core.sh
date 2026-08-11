@@ -15,13 +15,21 @@ VALID_ALGORITHMS=("aes-256-gcm" "chacha20-poly1305" "aes-128-gcm")
 declare -A CONFIG
 
 existing_tun_cidrs() {
+local excluded_config="${1:-}"
+local file
+for file in "${config_dir}"/*.toml; do
+[[ -f "$file" ]] || continue
+if [[ -n "$excluded_config" ]] && { [[ "$file" == "$excluded_config" ]] || [[ "$file" -ef "$excluded_config" ]]; }; then
+continue
+fi
 awk '
 FNR==1 { in_tun=0 }
 /^\[/ { in_tun = ($0 == "[tun]") }
 in_tun && /^(local_addr|remote_addr) = "/ {
 if (match($0, /"[^"]*"/)) print substr($0, RSTART+1, RLENGTH-2)
 }
-' "${config_dir}"/*.toml 2>/dev/null
+' "$file" 2>/dev/null
+done
 }
 toml_tun_name() {
 local file="$1"
@@ -57,13 +65,14 @@ return 1
 }
 is_tun_subnet_in_use() {
 local cidr="$1"
+local excluded_config="${2:-}"
 local existing
 while IFS= read -r existing; do
 [[ -z "$existing" ]] && continue
 if cidr_overlaps "$cidr" "$existing"; then
 return 0
 fi
-done <<< "$(existing_tun_cidrs)"
+done <<< "$(existing_tun_cidrs "$excluded_config")"
 return 1
 }
 suggest_tun_subnet_third_octet() {
@@ -77,14 +86,29 @@ echo "$third"
 }
 is_tun_name_in_use() {
 local name="$1"
-grep -qxF "name = \"${name}\"" "${config_dir}"/*.toml 2>/dev/null
+local excluded_config="${2:-}"
+local file
+for file in "${config_dir}"/*.toml; do
+[[ -f "$file" ]] || continue
+if [[ -n "$excluded_config" ]] && { [[ "$file" == "$excluded_config" ]] || [[ "$file" -ef "$excluded_config" ]]; }; then
+continue
+fi
+[[ "$(toml_tun_name "$file")" == "$name" ]] && return 0
+done
+return 1
 }
 is_tunnel_port_in_use() {
 local mode="$1"
 local port="$2"
+local excluded_config="${3:-}"
 local prefix
 [[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
-[[ -f "${config_dir}/${prefix}${port}.toml" ]]
+local candidate="${config_dir}/${prefix}${port}.toml"
+[[ -f "$candidate" ]] || return 1
+if [[ -n "$excluded_config" ]] && { [[ "$candidate" == "$excluded_config" ]] || [[ "$candidate" -ef "$excluded_config" ]]; }; then
+return 1
+fi
+return 0
 }
 is_port_listening_system_wide() {
 local port="$1"
@@ -911,6 +935,7 @@ prompt_tun_section() {
 local transport="$1"
 local mode="$2"
 local is_ipx="$3"
+local excluded_config="${4:-}"
 [[ "$transport" != "tun" ]] && return
 colorize blue "━━━ TUN Configuration ━━━" bold
 local suggested_name
@@ -919,7 +944,7 @@ while true; do
 prompt_with_default "TUN Device Name" "$suggested_name" CONFIG[tun_name]
 if ! is_valid_tun_name "${CONFIG[tun_name]}"; then
 colorize red "Invalid name. Use up to 15 letters/digits/-/_ characters (Linux interface name limit)."
-elif is_tun_name_in_use "${CONFIG[tun_name]}"; then
+elif is_tun_name_in_use "${CONFIG[tun_name]}" "$excluded_config"; then
 colorize red "Device name '${CONFIG[tun_name]}' is already used by another tunnel on this server. Choose another."
 else
 break
@@ -941,7 +966,7 @@ if ! validate_cidr "${CONFIG[tun_local_addr]}"; then
 colorize red "Invalid CIDR format."
 continue
 fi
-if is_tun_subnet_in_use "${CONFIG[tun_local_addr]}"; then
+if is_tun_subnet_in_use "${CONFIG[tun_local_addr]}" "$excluded_config"; then
 colorize red "This subnet overlaps with an existing tunnel's TUN subnet. Choose a different one."
 continue
 fi
@@ -953,7 +978,7 @@ if ! validate_cidr "${CONFIG[tun_remote_addr]}"; then
 colorize red "Invalid CIDR format."
 continue
 fi
-if is_tun_subnet_in_use "${CONFIG[tun_remote_addr]}"; then
+if is_tun_subnet_in_use "${CONFIG[tun_remote_addr]}" "$excluded_config"; then
 colorize red "This subnet overlaps with an existing tunnel's TUN subnet. Choose a different one."
 continue
 fi
@@ -964,7 +989,7 @@ local original_health_port="${CONFIG[tun_health_port]}"
 local suggested_port="${original_health_port:-$(suggest_free_tunnel_port "$mode")}"
 while true; do
 prompt_with_default "Health Port" "$suggested_port" CONFIG[tun_health_port]
-if is_tunnel_port_in_use "$mode" "${CONFIG[tun_health_port]}"; then
+if is_tunnel_port_in_use "$mode" "${CONFIG[tun_health_port]}" "$excluded_config"; then
 colorize red "Port ${CONFIG[tun_health_port]} is already used by another ${mode} tunnel on this server. Choose another."
 elif [[ "${CONFIG[tun_health_port]}" != "$original_health_port" ]] && is_port_listening_system_wide "${CONFIG[tun_health_port]}"; then
 colorize red "Port ${CONFIG[tun_health_port]} is already in use by another process on this server. Choose another."
@@ -1853,7 +1878,7 @@ prompt_transport_section "$mode"
 local is_tun="false" is_ipx="false"
 [[ "${CONFIG[transport_type]}" == "tun" ]] && is_tun="true"
 [[ "${CONFIG[tun_encapsulation]}" == "ipx" ]] && is_ipx="true"
-prompt_tun_section "${CONFIG[transport_type]}" "$mode" "$is_ipx"
+prompt_tun_section "${CONFIG[transport_type]}" "$mode" "$is_ipx" "$config_path"
 prompt_ipx_section "$is_ipx" "$mode"
 if [[ "$is_ipx" != "true" ]]; then
 prompt_connection_section "$mode"
