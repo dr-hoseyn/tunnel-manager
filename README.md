@@ -15,6 +15,7 @@ This isn't a wrapper around one tool. Each engine is a self-contained module (`c
 - [Security](#security)
 - [Backups](#backups)
 - [Health monitoring](#health-monitoring)
+- [Smart Auto-MTU for TUN/IPX](#smart-auto-mtu-for-tunipx)
 - [Network optimization](#network-optimization)
 - [Migrating to a new VPS](#migrating-to-a-new-vps)
 - [Troubleshooting](#troubleshooting)
@@ -140,6 +141,20 @@ Backhaul editing snapshots the config + systemd unit under `/root/backhaul-core/
 
 A systemd timer (`backhaul-watchdog.timer`) runs every 5 minutes and restarts an inactive tunnel only when its unit is enabled. A deliberately disabled tunnel stays disabled. It also checks the shared TLS certificate and restarts only enabled dependents when replacement is genuinely required.
 
+## Smart Auto-MTU for TUN/IPX
+
+Backhaul TUN/IPX tunnels can opt into a bounded adaptive MTU controller. New IPX configurations are prompted for an initial MTU, minimum, maximum, and step; existing tunnels stay disabled until enabled from **Tunnel management > Smart Auto-MTU** or a full edit.
+
+The controller follows a conservative probe/confirm/rollback state machine inspired by [RFC 8899 DPLPMTUD](https://www.rfc-editor.org/rfc/rfc8899.html):
+
+- A small control probe must first show that the tunnel and general network are healthy. If small packets also fail, MTU is not blamed and nothing is changed.
+- Lowering requires two consecutive size-specific failure samples; raising requires three consecutive healthy samples.
+- A candidate is tested against the current MTU as an A/B probe. It is accepted only when delivery score improves and the small control path remains healthy; otherwise the exact config is restored and the service restarted on its previous MTU.
+- Automatic changes are skipped while service traffic exceeds 256 KiB/s, system load is high, traffic accounting is unavailable, the service has been up for less than ten minutes, or the controller is in cooldown.
+- Defaults are `1200-1420` with a `20` byte step. Hard safety limits are `1000-1500`. An accepted or rejected candidate changes at most one step per evaluation; a rejected upward probe closes upward exploration until learning is manually reset.
+
+State is stored per tunnel under `/root/backhaul-core/.auto-mtu/`. The tunnel detail page shows the latest baseline, skip reason, accepted/rejected decision, and provides a safe one-shot evaluation, enable/disable control, bound editing, and learning reset.
+
 ## Network optimization
 
 **Optimize Network** (menu item 11) tunes the underlying OS/kernel network stack — this is independent of, and complementary to, each engine's own tuning options (e.g. Backhaul's `so_rcvbuf`/`so_sndbuf`/`mss`/mux settings). It applies:
@@ -159,6 +174,7 @@ There's no one-click export yet (see [Roadmap](#roadmap)). Today, moving a worki
 - The engine's own binary, if you'd rather not re-download it.
 - `/root/backhaul-core/cert_files/` if the tunnel uses TLS.
 - `/root/backhaul-core/.meta/<config_name>.meta` for the peer IP/SSH port diagnostics remember.
+- `/root/backhaul-core/.auto-mtu/` if you want to preserve learned TUN/IPX MTU bounds/history (optional; settings can be recreated from Edit).
 
 Then re-run that engine's **Edit** flow once on the new server so the systemd service gets (re)created correctly, rather than hand-writing the unit file.
 

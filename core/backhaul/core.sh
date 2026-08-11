@@ -447,6 +447,10 @@ tun_name=$(toml_tun_name "$config_path")
 if [[ -n "$tun_name" ]] && ! tun_iface_exists "$tun_name"; then
 logger -t backhaul-watchdog "${service_name} TUN interface ${tun_name} is down, restarting" 2>/dev/null
 systemctl restart "$service_name" 2>/dev/null
+continue
+fi
+if tunnel_is_ipx "$config_path"; then
+automtu_run "$config_path" watchdog || true
 fi
 fi
 done
@@ -968,9 +972,35 @@ else
 prompt_with_default "Health Port" "${CONFIG[tun_health_port]:-1234}" CONFIG[tun_health_port]
 fi
 if [[ "$is_ipx" == "true" ]]; then
+while true; do
 prompt_with_default "MTU" "${CONFIG[tun_mtu]:-1320}" CONFIG[tun_mtu]
+if [[ "${CONFIG[tun_mtu]}" =~ ^[0-9]+$ ]] && (( CONFIG[tun_mtu] >= AUTOMTU_HARD_MIN && CONFIG[tun_mtu] <= AUTOMTU_HARD_MAX )); then
+break
+fi
+colorize red "MTU must be between ${AUTOMTU_HARD_MIN} and ${AUTOMTU_HARD_MAX}."
+done
+prompt_boolean "Enable Smart Auto-MTU" "${CONFIG[smart_auto_mtu]:-true}" CONFIG[smart_auto_mtu]
+if [[ "${CONFIG[smart_auto_mtu]}" == "true" ]]; then
+while true; do
+prompt_with_default "Smart MTU Minimum" "${CONFIG[smart_mtu_min]:-$AUTOMTU_DEFAULT_MIN}" CONFIG[smart_mtu_min]
+prompt_with_default "Smart MTU Maximum" "${CONFIG[smart_mtu_max]:-$AUTOMTU_DEFAULT_MAX}" CONFIG[smart_mtu_max]
+prompt_with_default "Smart MTU Step" "${CONFIG[smart_mtu_step]:-$AUTOMTU_DEFAULT_STEP}" CONFIG[smart_mtu_step]
+if automtu_validate_settings "${CONFIG[smart_mtu_min]}" "${CONFIG[smart_mtu_max]}" "${CONFIG[smart_mtu_step]}" &&
+(( CONFIG[tun_mtu] >= CONFIG[smart_mtu_min] && CONFIG[tun_mtu] <= CONFIG[smart_mtu_max] )); then
+break
+fi
+colorize red "Invalid Smart MTU range/step, or current MTU is outside the selected range."
+done
+fi
 else
+while true; do
 prompt_with_default "MTU" "${CONFIG[tun_mtu]:-1500}" CONFIG[tun_mtu]
+if [[ "${CONFIG[tun_mtu]}" =~ ^[0-9]+$ ]] && (( CONFIG[tun_mtu] >= AUTOMTU_HARD_MIN && CONFIG[tun_mtu] <= AUTOMTU_HARD_MAX )); then
+break
+fi
+colorize red "MTU must be between ${AUTOMTU_HARD_MIN} and ${AUTOMTU_HARD_MAX}."
+done
+CONFIG[smart_auto_mtu]="false"
 fi
 echo ""
 }
@@ -1348,6 +1378,12 @@ fi
 local peer_ip_for_meta="${CONFIG[peer_ip]}"
 [[ -z "$peer_ip_for_meta" && "$is_ipx" == "true" ]] && peer_ip_for_meta="${CONFIG[ipx_dst_ip]}"
 write_tunnel_meta "$config_name" "$peer_ip_for_meta" "${CONFIG[peer_ssh_port]}"
+if [[ "$is_ipx" == "true" ]]; then
+automtu_save_settings "$config_name" "${CONFIG[smart_auto_mtu]:-false}" "${CONFIG[smart_mtu_min]:-$AUTOMTU_DEFAULT_MIN}" "${CONFIG[smart_mtu_max]:-$AUTOMTU_DEFAULT_MAX}" "${CONFIG[smart_mtu_step]:-$AUTOMTU_DEFAULT_STEP}"
+automtu_reset_learning "$config_name"
+else
+automtu_delete_state "$config_name" 2>/dev/null || true
+fi
 ensure_watchdog_installed
 ensure_journal_limits
 echo ""
@@ -1600,6 +1636,7 @@ if (length(line) > 0) printf "%s,", line
 }
 load_toml_into_config() {
 local file="$1"
+local config_name="${2:-}"
 reset_config
 CONFIG[bind_addr]=$(toml_get "$file" "listener" "bind_addr")
 CONFIG[remote_addr]=$(toml_get "$file" "dialer" "remote_addr")
@@ -1613,6 +1650,7 @@ CONFIG[tun_name]=$(toml_get "$file" "tun" "name")
 CONFIG[tun_local_addr]=$(toml_get "$file" "tun" "local_addr")
 CONFIG[tun_remote_addr]=$(toml_get "$file" "tun" "remote_addr")
 CONFIG[tun_health_port]=$(toml_get "$file" "tun" "health_port")
+CONFIG[tun_mtu]=$(toml_get "$file" "tun" "mtu")
 CONFIG[ipx_mode]=$(toml_get "$file" "ipx" "mode")
 CONFIG[ipx_profile]=$(toml_get "$file" "ipx" "profile")
 CONFIG[ipx_listen_ip]=$(toml_get "$file" "ipx" "listen_ip")
@@ -1636,10 +1674,12 @@ CONFIG[workers]=$(toml_get "$file" "tuning" "workers")
 CONFIG[log_level]=$(toml_get "$file" "logging" "log_level")
 CONFIG[forwarder]=$(toml_get "$file" "ports" "forwarder")
 CONFIG[ports_mapping]=$(load_toml_ports_mapping "$file")
-local config_name
-config_name=$(basename "${file%.toml}")
+[[ -n "$config_name" ]] || config_name=$(basename "${file%.toml}")
 CONFIG[peer_ip]=$(tunnel_peer_ip "$file" "$config_name")
 CONFIG[peer_ssh_port]=$(tunnel_peer_ssh_port "$config_name")
+if tunnel_is_ipx "$file"; then
+automtu_load_settings_into_config "$config_name" 2>/dev/null || true
+fi
 }
 toggle_tunnel_enabled() {
 local service_name="$1"
@@ -1799,7 +1839,7 @@ service_path="${service_dir}/${service_name}"
 local backup_dir
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "$config_name")
 colorize green "Current config backed up: $backup_dir"
-load_toml_into_config "${backup_dir}/config.toml"
+load_toml_into_config "${backup_dir}/config.toml" "$config_name"
 local old_forwarder="${CONFIG[forwarder]}" old_mapping="${CONFIG[ports_mapping]}" old_tun_remote_addr="${CONFIG[tun_remote_addr]}"
 local old_accept_udp="${CONFIG[accept_udp]}" old_ipx_profile="${CONFIG[ipx_profile]}"
 clear
@@ -1881,6 +1921,15 @@ write_tunnel_meta "$new_config_name" "$peer_ip_for_meta" "${CONFIG[peer_ssh_port
 create_systemd_service "$prefix" "$new_port" "$new_config_path" || apply_ok="false"
 fi
 if [[ "$apply_ok" == "true" ]] && systemctl is-active --quiet "$new_service_name"; then
+if [[ "$is_ipx" == "true" ]]; then
+automtu_save_settings "$new_config_name" "${CONFIG[smart_auto_mtu]:-false}" "${CONFIG[smart_mtu_min]:-$AUTOMTU_DEFAULT_MIN}" "${CONFIG[smart_mtu_max]:-$AUTOMTU_DEFAULT_MAX}" "${CONFIG[smart_mtu_step]:-$AUTOMTU_DEFAULT_STEP}"
+automtu_reset_learning "$new_config_name"
+else
+automtu_delete_state "$new_config_name" 2>/dev/null || true
+fi
+if [[ "$new_config_name" != "$config_name" ]]; then
+automtu_delete_state "$config_name" 2>/dev/null || true
+fi
 colorize green "✔ Changes applied successfully; service is healthy."
 rm -rf "$backup_dir"
 else
@@ -2014,6 +2063,73 @@ write_tunnel_last_test "$config_name" "benchmark:${best_key:-none}"
 echo ""
 press_key
 }
+smart_auto_mtu_menu() {
+local config_path="$1" config_name state_file current enabled min_mtu max_mtu step choice new_enabled
+config_name=$(basename "${config_path%.toml}")
+if ! tunnel_is_tun "$config_path" || ! tunnel_is_ipx "$config_path"; then
+colorize red "Smart Auto-MTU is available only for Backhaul TUN/IPX tunnels."
+press_key
+return 1
+fi
+state_file=$(automtu_state_file "$config_name") || return 1
+while true; do
+current=$(toml_get "$config_path" tun mtu)
+enabled=$(automtu_state_get "$state_file" enabled "false")
+min_mtu=$(automtu_state_get "$state_file" min_mtu "$AUTOMTU_DEFAULT_MIN")
+max_mtu=$(automtu_state_get "$state_file" max_mtu "$AUTOMTU_DEFAULT_MAX")
+step=$(automtu_state_get "$state_file" step "$AUTOMTU_DEFAULT_STEP")
+clear
+colorize cyan "Smart Auto-MTU: ${config_name}" bold
+echo ""
+echo "Status:       ${enabled}"
+echo "Current MTU:  ${current}"
+echo "Allowed:      ${min_mtu}-${max_mtu} (step ${step})"
+echo "Last result:  $(automtu_state_get "$state_file" last_result "never-run")"
+echo "Last skip:    $(automtu_state_get "$state_file" last_skip "none")"
+echo "Last sample:  $(automtu_state_get "$state_file" last_baseline "none")"
+echo ""
+colorize cyan "1) Run one safe A/B evaluation now"
+colorize yellow "2) Enable/disable automatic checks"
+echo "3) Change bounds and step"
+echo "4) Reset learned history"
+echo "0) Back"
+echo ""
+read -r -p "Choice: " choice
+case "$choice" in
+1)
+automtu_run "$config_path" manual
+press_key
+;;
+2)
+[[ "$enabled" == "true" ]] && new_enabled="false" || new_enabled="true"
+automtu_save_settings "$config_name" "$new_enabled" "$min_mtu" "$max_mtu" "$step"
+colorize green "Smart Auto-MTU set to ${new_enabled}."
+sleep 1
+;;
+3)
+while true; do
+prompt_with_default "Minimum MTU" "$min_mtu" min_mtu
+prompt_with_default "Maximum MTU" "$max_mtu" max_mtu
+prompt_with_default "Step" "$step" step
+if automtu_validate_settings "$min_mtu" "$max_mtu" "$step" && (( current >= min_mtu && current <= max_mtu )); then
+automtu_save_settings "$config_name" "$enabled" "$min_mtu" "$max_mtu" "$step"
+automtu_reset_learning "$config_name"
+break
+fi
+colorize red "Invalid range/step, or current MTU is outside the selected range."
+done
+;;
+4)
+automtu_reset_learning "$config_name"
+colorize green "Learned Auto-MTU history reset; settings were preserved."
+sleep 1
+;;
+0) return ;;
+*) colorize red "Invalid choice"; sleep 1 ;;
+esac
+done
+}
+
 tunnel_detail_page() {
 local config_path="$1"
 local config_name service_name role transport ipx_profile peer_ip last_test last_time ports_count
@@ -2036,6 +2152,9 @@ fi
 IFS='|' read -r last_test last_time <<< "$(read_tunnel_last_test "$config_name")"
 echo "Last test: ${last_test} (${last_time})"
 echo "Tunnel type: ${transport}${ipx_profile:+ / ipx:$ipx_profile}"
+if [[ -n "$ipx_profile" ]]; then
+echo "Smart Auto-MTU: $(automtu_status_text "$config_name" "$(toml_get "$config_path" tun mtu)")"
+fi
 echo "Role: $([[ "$role" == "server" ]] && echo "IRAN (Server)" || echo "KHAREJ (Client)")"
 if [[ -n "$peer_ip" ]]; then echo "Peer IP: ${peer_ip}"; else echo "Peer IP: not set"; fi
 if [[ "$role" == "server" ]]; then
@@ -2057,6 +2176,7 @@ echo "4) View service logs"
 echo "5) View service status"
 colorize yellow "6) Restart service"
 colorize red "7) Remove this tunnel"
+colorize cyan "8) Smart Auto-MTU"
 echo "0) Back"
 echo ""
 read -r -p "Choice: " choice
@@ -2068,6 +2188,7 @@ case "$choice" in
 5) view_service_status "$service_name" ;;
 6) restart_service "$service_name" ;;
 7) destroy_tunnel "$config_path"; return ;;
+8) smart_auto_mtu_menu "$config_path" ;;
 0) return ;;
 *) colorize red "Invalid choice"; sleep 1 ;;
 esac
@@ -2085,6 +2206,7 @@ removed_profile=$(toml_ipx_profile "$config_path")
 removed_forwarder=$(toml_get "$config_path" "ports" "forwarder")
 removed_mapping=$(load_toml_ports_mapping "$config_path")
 removed_tun_remote_addr=$(toml_get "$config_path" "tun" "remote_addr")
+automtu_delete_state "$config_name" 2>/dev/null || true
 tm_firewall_close_owner "backhaul:${config_name}"
 tm_firewall_close_owner "backhaul:${config_name}:control"
 if [[ -n "$removed_forwarder" && "$removed_forwarder" != "backhaul" ]]; then

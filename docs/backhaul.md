@@ -21,6 +21,18 @@ Transports available in this panel: `tcp`, `tcpmux`, `xtcpmux`, `ws`, `wss`, `ws
 
 TUN mode also supports an `ipx` encapsulation submode (profiles: `icmp`, `ipip`, `udp`, `tcp`, `gre`, `bip`) for cases where you specifically need to tunnel over a non-standard protocol.
 
+### Smart Auto-MTU for TUN/IPX
+
+TUN/IPX can enable a per-tunnel adaptive MTU controller. It does not react to ordinary packet loss by blindly lowering MTU. A small probe first verifies that the general tunnel path is healthy; only a repeatable difference between small and near-MTU probes is considered size-specific evidence.
+
+- Defaults: current `1320`, allowed range `1200-1420`, step `20` (all configurable).
+- Downward change: two consecutive black-hole/large-packet failures while small probes remain healthy.
+- Upward change: three consecutive clean checks, followed by a larger candidate probe.
+- Every candidate restarts the service only during low traffic, runs an A/B comparison, and is kept only if its delivery score improves. Failure, ambiguous results, or a degraded small probe cause immediate rollback.
+- Checks pause on high traffic, high CPU load, missing systemd traffic accounting, a recently restarted service, or cooldown. This is deliberately slower than an aggressive optimizer because avoiding a wrong change matters more than finding the theoretical maximum quickly.
+
+Open **Tunnel management**, select the IPX tunnel, then choose **Smart Auto-MTU** to run one guarded evaluation, toggle automation, change limits, or reset learned history. Both ends should use compatible bounds; each side still evaluates its own outbound path independently.
+
 ## Advantages
 
 - Highest raw throughput ceiling of the engines in this panel for plain TCP traffic.

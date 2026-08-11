@@ -17,4 +17,7 @@ jobs:
       - name: ShellCheck
         run: shellcheck -x -S warning install.sh tunnel-manager.sh lib/*.sh core/*/*.sh tests/*.sh
       - name: Unit tests
-        run: bash tests/test-core.sh
+        run: |
+          for test_file in tests/test-*.sh; do
+            bash "$test_file"
+          done

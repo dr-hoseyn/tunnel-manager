@@ -14,6 +14,8 @@ mkdir -p "$config_dir" "$service_dir"
 
 # shellcheck source=../lib/common.sh
 source "${ROOT_DIR}/lib/common.sh"
+# shellcheck source=../lib/auto_mtu.sh
+source "${ROOT_DIR}/lib/auto_mtu.sh"
 # shellcheck source=../core/backhaul/core.sh
 source "${ROOT_DIR}/core/backhaul/core.sh"
 # shellcheck source=../core/hysteria2/core.sh
@@ -159,6 +161,34 @@ test_edit_cancel_keeps_live_config() {
 fail "Backhaul edit still moves the live config before the user finishes editing"
 }
 
+test_edit_load_uses_live_identity_and_mtu() {
+local config_path="${TEST_ROOT}/config.toml" meta_path
+cat > "$config_path" <<'EOF'
+[transport]
+type = "tun"
+
+[tun]
+encapsulation = "ipx"
+name = "test0"
+local_addr = "10.10.10.1/24"
+remote_addr = "10.10.10.2/24"
+mtu = 1320
+
+[ipx]
+mode = "server"
+profile = "tcp"
+EOF
+meta_path=$(tunnel_meta_file 'iran1234')
+mkdir -p "$(dirname "$meta_path")"
+printf 'peer_ip=192.0.2.44\npeer_ssh_port=2222\n' > "$meta_path"
+automtu_save_settings iran1234 true 1200 1420 20
+load_toml_into_config "$config_path" iran1234
+assert_eq "${CONFIG[tun_mtu]}" '1320'
+assert_eq "${CONFIG[peer_ip]}" '192.0.2.44'
+assert_eq "${CONFIG[peer_ssh_port]}" '2222'
+assert_eq "${CONFIG[smart_auto_mtu]}" 'true'
+}
+
 test_backup_restores_metadata() {
 local config_path="${TEST_ROOT}/edit.toml" service_path="${TEST_ROOT}/edit.service"
 local meta_path backup_dir
@@ -209,6 +239,7 @@ test_verified_reverse_configs
 test_watchdog_respects_disable
 test_edit_restarts_active_service
 test_edit_cancel_keeps_live_config
+test_edit_load_uses_live_identity_and_mtu
 test_backup_restores_metadata
 test_optimize_exact_rollback
 printf 'All tunnel-manager core tests passed.\n'

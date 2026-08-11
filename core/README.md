@@ -60,6 +60,14 @@ prefix (`rathole-iran2333`, `hysteria2-iran36712`, `frp-iran7000`,
 `tuic-iran44300`) when calling these so they never collide with a
 same-numbered Backhaul tunnel.
 
+Backhaul's adaptive TUN/IPX MTU state machine lives separately in
+`lib/auto_mtu.sh`. It is sourced before the core modules, stores only panel
+state under `.auto-mtu` (never unknown keys in Backhaul's TOML), and is called
+from Backhaul's watchdog/detail UI. Keep its control-probe, low-traffic,
+cooldown, bounded-step, A/B confirmation, and rollback gates intact when
+changing the policy; they prevent unrelated network failures from being
+misdiagnosed as MTU failures.
+
 Each core also picks its own config format/tooling depending on what the
 upstream engine actually speaks and what's verifiable against real upstream
 docs/source — don't force a common format:
