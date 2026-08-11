@@ -71,9 +71,9 @@ docs/source — don't force a common format:
 
 Port-forwarding direction also varies by engine, not by convention — follow
 what each upstream tool actually does rather than forcing IRAN/KHAREJ
-symmetry: Backhaul/Rathole/FRP put the forwarded-port config on the SERVER
-(IRAN) side; Hysteria2/TUIC put it on the CLIENT (KHAREJ) side, because
-that's where each protocol's own local-forward feature lives.
+symmetry: Backhaul/Rathole/FRP expose public ports through their IRAN server
+roles. Hysteria2/TUIC put forwarding on their client, so their reverse-tunnel
+direction is intentionally inverted: CLIENT on IRAN, SERVER on KHAREJ.
 
 ## Checklist for adding a new core
 

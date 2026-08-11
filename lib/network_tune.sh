@@ -1,182 +1,294 @@
 #!/usr/bin/env bash
-# Kernel/network tuning menu-driven counterpart of the standalone
-# https://github.com/dr-hoseyn/vm-network-tuner script: buffers, BBR+fq,
-# conntrack, and ephemeral-port reservation for whatever this panel's
-# engines currently have listening. Sourced by tunnel-manager.sh right after
-# lib/common.sh (needs colorize/press_key and the config_dir global, nothing
-# engine-specific).
+# shellcheck disable=SC2154 # config_dir is provided by tunnel-manager.sh before sourcing.
+# Conservative, reversible network tuning for tunnel-manager.
+# This file is sourced by tunnel-manager.sh after lib/common.sh.
+
 NETTUNE_SYSCTL_CONF="/etc/sysctl.d/99-tunnel-vm.conf"
 NETTUNE_BBR_MODULE_CONF="/etc/modules-load.d/tunnel-vm-bbr.conf"
 NETTUNE_SYSTEMD_LIMIT_CONF="/etc/systemd/system.conf.d/99-tunnel-vm-nofile.conf"
+NETTUNE_LIMITS_CONF="/etc/security/limits.conf"
+NETTUNE_MEMINFO="/proc/meminfo"
+NETTUNE_CONNTRACK_PATH="/proc/sys/net/netfilter/nf_conntrack_max"
 NETTUNE_LIMITS_TAG="tunnel-manager-network-tune"
+NETTUNE_STATE_DIR="${config_dir}/.network-tune-state"
+NETTUNE_VALUES_FILE="${NETTUNE_STATE_DIR}/sysctl-values.tsv"
 NETTUNE_LAST_BACKUP_FILE="${config_dir}/.network-tune-last-backup"
 
 core_optimize_is_applied() {
 [[ -f "$NETTUNE_SYSCTL_CONF" ]]
 }
 
-# Snapshot of everything this touches, kept next to the panel's other backups
-# (config_dir/.backups) rather than loose files under /root.
-core_optimize_backup() {
-local ts backup_dir
-ts=$(date +%Y%m%d%H%M%S)
-backup_dir="${config_dir}/.backups/network-tune.${ts}"
-mkdir -p "$backup_dir"
-sysctl -a > "${backup_dir}/sysctl-backup.txt" 2>/dev/null
-cp -n /etc/security/limits.conf "${backup_dir}/limits.conf.bak" 2>/dev/null
-echo "$backup_dir" > "$NETTUNE_LAST_BACKUP_FILE"
-echo "$backup_dir"
+nettune_snapshot_file() {
+local path="$1" name="$2"
+if [[ -e "$path" ]]; then
+printf '1\n' > "${NETTUNE_STATE_DIR}/${name}.exists"
+cp -a -- "$path" "${NETTUNE_STATE_DIR}/${name}.backup"
+else
+printf '0\n' > "${NETTUNE_STATE_DIR}/${name}.exists"
+fi
+}
+
+nettune_restore_file() {
+local path="$1" name="$2" existed
+existed=$(cat "${NETTUNE_STATE_DIR}/${name}.exists" 2>/dev/null || printf '0')
+if [[ "$existed" == "1" && -e "${NETTUNE_STATE_DIR}/${name}.backup" ]]; then
+mkdir -p "$(dirname "$path")"
+cp -a -- "${NETTUNE_STATE_DIR}/${name}.backup" "$path"
+else
+rm -f -- "$path"
+fi
+}
+
+nettune_keys() {
+cat <<'EOF'
+net.core.rmem_max
+net.core.wmem_max
+net.core.rmem_default
+net.core.wmem_default
+net.ipv4.tcp_rmem
+net.ipv4.tcp_wmem
+net.core.netdev_max_backlog
+net.core.somaxconn
+net.ipv4.tcp_max_syn_backlog
+net.ipv4.ip_local_port_range
+net.ipv4.ip_local_reserved_ports
+net.ipv4.tcp_fin_timeout
+net.ipv4.tcp_slow_start_after_idle
+net.ipv4.tcp_mtu_probing
+net.ipv4.tcp_keepalive_time
+net.ipv4.tcp_keepalive_intvl
+net.ipv4.tcp_keepalive_probes
+net.netfilter.nf_conntrack_max
+net.core.default_qdisc
+net.ipv4.tcp_congestion_control
+EOF
+}
+
+# Capture the baseline only once. Re-applying optimization must never replace
+# the values needed for a real rollback with already-tuned values.
+nettune_capture_baseline() {
+[[ -f "$NETTUNE_VALUES_FILE" ]] && return 0
+
+mkdir -p "$NETTUNE_STATE_DIR"
+chmod 700 "$NETTUNE_STATE_DIR"
+nettune_snapshot_file "$NETTUNE_SYSCTL_CONF" sysctl-conf || return 1
+nettune_snapshot_file "$NETTUNE_BBR_MODULE_CONF" bbr-module || return 1
+nettune_snapshot_file "$NETTUNE_SYSTEMD_LIMIT_CONF" systemd-limit || return 1
+nettune_snapshot_file "$NETTUNE_LIMITS_CONF" limits-conf || return 1
+
+: > "$NETTUNE_VALUES_FILE"
+local key value
+while IFS= read -r key; do
+[[ -n "$key" ]] || continue
+if value=$(sysctl -n "$key" 2>/dev/null); then
+printf '%s\t%s\n' "$key" "$value" >> "$NETTUNE_VALUES_FILE"
+fi
+done < <(nettune_keys)
+chmod 600 "$NETTUNE_VALUES_FILE"
+printf '%s\n' "$NETTUNE_STATE_DIR" > "$NETTUNE_LAST_BACKUP_FILE"
+}
+
+nettune_max_value() {
+local key="$1" proposed="$2" current
+current=$(sysctl -n "$key" 2>/dev/null || printf '0')
+if [[ "$current" =~ ^[0-9]+$ ]] && (( current > proposed )); then
+printf '%s' "$current"
+else
+printf '%s' "$proposed"
+fi
+}
+
+nettune_merge_reserved_ports() {
+local current listening
+current=$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)
+listening=$( { ss -Htln 2>/dev/null; ss -Huln 2>/dev/null; } |
+awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | paste -sd, - )
+
+printf '%s\n%s\n' "$current" "$listening" |
+tr ',' '\n' | awk 'NF && $0 ~ /^[0-9]+(-[0-9]+)?$/ { if (!seen[$0]++) print $0 }' |
+sort -V | paste -sd, -
+}
+
+nettune_remove_legacy_global_limits() {
+# Older releases changed limits for every login and every systemd service.
+# Panel units already carry their own LimitNOFILE, so these global mutations
+# are unnecessary and are removed while their exact old files remain saved.
+if grep -q "^# ${NETTUNE_LIMITS_TAG}$" "$NETTUNE_LIMITS_CONF" 2>/dev/null; then
+sed -i "/^# ${NETTUNE_LIMITS_TAG}$/,+4d" "$NETTUNE_LIMITS_CONF"
+fi
+if [[ -f "$NETTUNE_SYSTEMD_LIMIT_CONF" ]]; then
+rm -f -- "$NETTUNE_SYSTEMD_LIMIT_CONF"
+systemctl daemon-reexec 2>/dev/null || true
+fi
 }
 
 core_optimize_apply() {
-colorize cyan "━━━ Optimize Network (BBR, buffers, conntrack, port reservation) ━━━" bold
+colorize cyan "--- Optimize Network (safe and reversible) ---" bold
 echo ""
 
-local backup_dir
-backup_dir=$(core_optimize_backup)
-colorize green "Backup saved to ${backup_dir}"
-
-local bbr_ok=0
-if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
-modprobe tcp_bbr 2>/dev/null
+local bbr_ok=0 conntrack_ok=0
+if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+modprobe tcp_bbr 2>/dev/null || true
 fi
-if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
+if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
 bbr_ok=1
-colorize green "BBR is available"
-mkdir -p /etc/modules-load.d
-grep -qs '^tcp_bbr$' "$NETTUNE_BBR_MODULE_CONF" 2>/dev/null || echo tcp_bbr > "$NETTUNE_BBR_MODULE_CONF"
+fi
+[[ -e "$NETTUNE_CONNTRACK_PATH" ]] && conntrack_ok=1
+
+if ! nettune_capture_baseline; then
+colorize red "Could not save the pre-optimization state. Nothing was changed."
+return 1
+fi
+nettune_remove_legacy_global_limits
+
+local memory_kb buffer_max tcp_buffer conntrack_max backlog
+memory_kb=$(awk '/^MemTotal:/ {print $2; exit}' "$NETTUNE_MEMINFO" 2>/dev/null)
+memory_kb=${memory_kb:-2097152}
+if (( memory_kb < 2097152 )); then
+buffer_max=16777216; tcp_buffer=8388608; conntrack_max=131072; backlog=10000
+elif (( memory_kb < 8388608 )); then
+buffer_max=33554432; tcp_buffer=16777216; conntrack_max=262144; backlog=20000
 else
-colorize yellow "BBR not available in this kernel/container -- applying buffer tuning only"
+buffer_max=67108864; tcp_buffer=33554432; conntrack_max=524288; backlog=30000
 fi
 
-local conntrack_ok=0
-[[ -f /proc/sys/net/netfilter/nf_conntrack_max ]] || modprobe nf_conntrack 2>/dev/null
-if [[ -f /proc/sys/net/netfilter/nf_conntrack_max ]]; then
-conntrack_ok=1
-[[ -w /sys/module/nf_conntrack/parameters/hashsize ]] && echo 65536 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null
-colorize green "conntrack is available"
-else
-colorize yellow "conntrack not available in this kernel/container -- skipping"
+# Do not reduce a deliberately higher value already chosen by the admin.
+buffer_max=$(nettune_max_value net.core.rmem_max "$buffer_max")
+local wmem_max rmem_default wmem_default somaxconn syn_backlog
+wmem_max=$(nettune_max_value net.core.wmem_max "$buffer_max")
+rmem_default=$(nettune_max_value net.core.rmem_default 1048576)
+wmem_default=$(nettune_max_value net.core.wmem_default 1048576)
+backlog=$(nettune_max_value net.core.netdev_max_backlog "$backlog")
+somaxconn=$(nettune_max_value net.core.somaxconn 65535)
+syn_backlog=$(nettune_max_value net.ipv4.tcp_max_syn_backlog 8192)
+if [[ "$conntrack_ok" == "1" ]]; then
+conntrack_max=$(nettune_max_value net.netfilter.nf_conntrack_max "$conntrack_max")
 fi
 
-# Reserve ports already in LISTEN state instead of narrowing the ephemeral
-# range below -- this panel's engines are built for many concurrent
-# connections, so the range itself needs to stay wide.
-local reserved_ports
-reserved_ports=$( { ss -Htln 2>/dev/null; ss -Huln 2>/dev/null; } | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | paste -sd, - )
-if [[ -n "$reserved_ports" ]]; then
-colorize green "Reserving currently-listening ports from the ephemeral range: $reserved_ports"
-else
-colorize yellow "No listening ports detected to reserve"
-fi
+local current_tcp current_tcp_min current_tcp_default current_tcp_max
+local tcp_rmem_min=4096 tcp_rmem_default=87380 tcp_rmem_max="$tcp_buffer"
+local tcp_wmem_min=4096 tcp_wmem_default=65536 tcp_wmem_max="$tcp_buffer"
+current_tcp=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || true)
+read -r current_tcp_min current_tcp_default current_tcp_max <<< "$current_tcp"
+[[ "$current_tcp_min" =~ ^[0-9]+$ ]] && (( current_tcp_min > tcp_rmem_min )) && tcp_rmem_min="$current_tcp_min"
+[[ "$current_tcp_default" =~ ^[0-9]+$ ]] && (( current_tcp_default > tcp_rmem_default )) && tcp_rmem_default="$current_tcp_default"
+[[ "$current_tcp_max" =~ ^[0-9]+$ ]] && (( current_tcp_max > tcp_rmem_max )) && tcp_rmem_max="$current_tcp_max"
+current_tcp=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || true)
+read -r current_tcp_min current_tcp_default current_tcp_max <<< "$current_tcp"
+[[ "$current_tcp_min" =~ ^[0-9]+$ ]] && (( current_tcp_min > tcp_wmem_min )) && tcp_wmem_min="$current_tcp_min"
+[[ "$current_tcp_default" =~ ^[0-9]+$ ]] && (( current_tcp_default > tcp_wmem_default )) && tcp_wmem_default="$current_tcp_default"
+[[ "$current_tcp_max" =~ ^[0-9]+$ ]] && (( current_tcp_max > tcp_wmem_max )) && tcp_wmem_max="$current_tcp_max"
 
-cat > "$NETTUNE_SYSCTL_CONF" << 'EOF'
-# --- Network buffers ---
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
-net.core.netdev_max_backlog = 30000
-# --- Connection capacity (wide on purpose -- see ip_local_reserved_ports
-# below for how each tunnel's own bind port is kept safe) ---
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.ip_local_port_range = 1024 65535
+local current_range range_low=10000 range_high=65535 current_low current_high
+current_range=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || true)
+read -r current_low current_high <<< "$current_range"
+[[ "$current_low" =~ ^[0-9]+$ ]] && (( current_low >= 1024 && current_low < range_low )) && range_low="$current_low"
+[[ "$current_high" =~ ^[0-9]+$ ]] && (( current_high > range_high && current_high <= 65535 )) && range_high="$current_high"
+
+local reserved_ports temp_conf
+reserved_ports=$(nettune_merge_reserved_ports)
+mkdir -p "$(dirname "$NETTUNE_SYSCTL_CONF")"
+if ! temp_conf=$(mktemp "${NETTUNE_SYSCTL_CONF}.XXXXXX"); then
+colorize red "Could not create the temporary tuning file; restoring the saved state."
+core_optimize_rollback
+return 1
+fi
+cat > "$temp_conf" <<EOF
+# Managed by tunnel-manager. Remove through Optimize > Rollback.
+# Values are sized from installed RAM and never reduce larger admin settings.
+net.core.rmem_max = ${buffer_max}
+net.core.wmem_max = ${wmem_max}
+net.core.rmem_default = ${rmem_default}
+net.core.wmem_default = ${wmem_default}
+net.ipv4.tcp_rmem = ${tcp_rmem_min} ${tcp_rmem_default} ${tcp_rmem_max}
+net.ipv4.tcp_wmem = ${tcp_wmem_min} ${tcp_wmem_default} ${tcp_wmem_max}
+net.core.netdev_max_backlog = ${backlog}
+net.core.somaxconn = ${somaxconn}
+net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
+net.ipv4.ip_local_port_range = ${range_low} ${range_high}
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
-# --- Misc improvements ---
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_no_metrics_save = 1
-# --- Dead-peer detection for long-lived tunnel connections ---
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
 EOF
-
-[[ -n "$reserved_ports" ]] && echo "net.ipv4.ip_local_reserved_ports = $reserved_ports" >> "$NETTUNE_SYSCTL_CONF"
-
-if [[ "$conntrack_ok" == "1" ]]; then
-cat >> "$NETTUNE_SYSCTL_CONF" << 'EOF'
-# --- Connection tracking ---
-net.netfilter.nf_conntrack_max = 262144
-net.netfilter.nf_conntrack_tcp_timeout_established = 3600
-EOF
-fi
-
+[[ -n "$reserved_ports" ]] && printf 'net.ipv4.ip_local_reserved_ports = %s\n' "$reserved_ports" >> "$temp_conf"
+[[ "$conntrack_ok" == "1" ]] && printf 'net.netfilter.nf_conntrack_max = %s\n' "$conntrack_max" >> "$temp_conf"
 if [[ "$bbr_ok" == "1" ]]; then
-cat >> "$NETTUNE_SYSCTL_CONF" << 'EOF'
-# --- BBR ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-fi
-
-# -e: ignore keys this kernel/namespace doesn't expose (common in
-# OpenVZ/LXC guests) instead of aborting the whole apply on the first miss.
-sysctl -e -p "$NETTUNE_SYSCTL_CONF" > /dev/null
-colorize green "Sysctl settings applied"
-
-if [[ "$bbr_ok" == "1" ]]; then
-echo "Applying fq qdisc to active interfaces (default_qdisc alone only affects newly-created ones):"
-local iface
-for iface in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo$'); do
-if tc qdisc replace dev "$iface" root fq 2>/dev/null; then
-echo "  $iface -> fq"
+printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' >> "$temp_conf"
+mkdir -p "$(dirname "$NETTUNE_BBR_MODULE_CONF")"
+printf 'tcp_bbr\n' > "$NETTUNE_BBR_MODULE_CONF"
 else
-echo "  $iface -> could not set fq (non-fatal)"
+rm -f -- "$NETTUNE_BBR_MODULE_CONF"
 fi
-done
+chmod 644 "$temp_conf"
+if ! mv -f -- "$temp_conf" "$NETTUNE_SYSCTL_CONF"; then
+rm -f -- "$temp_conf"
+colorize red "Could not activate the tuning file; restoring the saved state."
+core_optimize_rollback
+return 1
 fi
 
-if ! grep -q "$NETTUNE_LIMITS_TAG" /etc/security/limits.conf 2>/dev/null; then
-cat >> /etc/security/limits.conf << EOF
-# $NETTUNE_LIMITS_TAG
-* soft nofile 1048576
-* hard nofile 1048576
-root soft nofile 1048576
-root hard nofile 1048576
-EOF
+if ! sysctl -e -p "$NETTUNE_SYSCTL_CONF" >/dev/null; then
+colorize red "Kernel rejected one or more tuning values; restoring the saved state."
+core_optimize_rollback
+return 1
 fi
-colorize green "limits.conf updated"
 
-# Every engine in this panel already sets LimitNOFILE=1048576 on its own
-# systemd unit, so this drop-in is for OTHER services on the box (sshd, nginx,
-# cron, ...) -- limits.conf itself is only read by PAM login sessions.
-mkdir -p /etc/systemd/system.conf.d
-cat > "$NETTUNE_SYSTEMD_LIMIT_CONF" << 'EOF'
-[Manager]
-DefaultLimitNOFILE=1048576
-EOF
-systemctl daemon-reexec 2>/dev/null
-colorize green "systemd DefaultLimitNOFILE raised for non-panel services"
-
-echo ""
-colorize blue "── Verification ──" bold
-echo "Congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a)"
-echo "Qdisc:               $(sysctl -n net.core.default_qdisc 2>/dev/null || echo n/a)"
-echo "somaxconn:           $(sysctl -n net.core.somaxconn 2>/dev/null)"
+colorize green "Network tuning applied. Original values are saved in: $NETTUNE_STATE_DIR"
+echo "RAM profile:          $((memory_kb / 1024)) MB"
+echo "Congestion control:  $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a)"
+echo "Default qdisc:       $(sysctl -n net.core.default_qdisc 2>/dev/null || echo n/a)"
+echo "Socket buffers:      rmem=${buffer_max}, wmem=${wmem_max}"
+echo "somaxconn:           $(sysctl -n net.core.somaxconn 2>/dev/null || echo n/a)"
 [[ "$conntrack_ok" == "1" ]] && echo "conntrack max:       $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
 [[ -n "$reserved_ports" ]] && echo "Reserved ports:      $reserved_ports"
 echo ""
-colorize yellow "Note: so_rcvbuf/so_sndbuf in a tunnel's config are capped by rmem_max/wmem_max (now 64MB) -- values like so_rcvbuf=4194304 will now actually take effect instead of being silently clamped."
-colorize yellow "Note: if a TUN tunnel uses ipx encapsulation (gre/ipip/icmp/...), set that tunnel's own 'mss' explicitly (1200-1360) -- tcp_mtu_probing alone doesn't fully cover the encapsulation overhead."
-colorize yellow "Reserved-port detection above is a snapshot -- re-run this after configuring a new tunnel/port."
+colorize yellow "Re-run Optimize after adding listeners so their ports are merged into the reservation list."
+colorize yellow "No active qdisc, global PAM limit, or global systemd limit is modified."
 }
 
 core_optimize_rollback() {
-if ! core_optimize_is_applied && [[ ! -f "$NETTUNE_BBR_MODULE_CONF" ]]; then
+if [[ ! -f "$NETTUNE_VALUES_FILE" ]]; then
+# Compatibility cleanup for installations optimized by an older release.
+if core_optimize_is_applied || [[ -f "$NETTUNE_BBR_MODULE_CONF" || -f "$NETTUNE_SYSTEMD_LIMIT_CONF" ]]; then
+rm -f -- "$NETTUNE_SYSCTL_CONF" "$NETTUNE_BBR_MODULE_CONF" "$NETTUNE_SYSTEMD_LIMIT_CONF"
+sed -i "/^# ${NETTUNE_LIMITS_TAG}$/,+4d" "$NETTUNE_LIMITS_CONF" 2>/dev/null || true
+sysctl --system >/dev/null 2>&1 || true
+systemctl daemon-reexec 2>/dev/null || true
+colorize yellow "Legacy optimization files were removed. An exact old runtime snapshot was not available."
+else
 colorize yellow "Nothing to roll back -- optimization was never applied."
+fi
 return 0
 fi
-rm -f "$NETTUNE_SYSCTL_CONF" "$NETTUNE_BBR_MODULE_CONF" "$NETTUNE_SYSTEMD_LIMIT_CONF"
-sed -i "/# $NETTUNE_LIMITS_TAG/,+4d" /etc/security/limits.conf 2>/dev/null
-systemctl daemon-reexec 2>/dev/null
-sysctl --system > /dev/null 2>&1
-local last_backup
-last_backup=$(cat "$NETTUNE_LAST_BACKUP_FILE" 2>/dev/null)
-colorize green "Rolled back. Pre-change values are still in: ${last_backup:-${config_dir}/.backups/}"
+
+nettune_restore_file "$NETTUNE_SYSCTL_CONF" sysctl-conf
+nettune_restore_file "$NETTUNE_BBR_MODULE_CONF" bbr-module
+nettune_restore_file "$NETTUNE_SYSTEMD_LIMIT_CONF" systemd-limit
+nettune_restore_file "$NETTUNE_LIMITS_CONF" limits-conf
+sysctl --system >/dev/null 2>&1 || true
+
+local key value restore_failed=0
+while IFS=$'\t' read -r key value; do
+[[ -n "$key" ]] || continue
+if ! sysctl -w "${key}=${value}" >/dev/null 2>&1; then
+restore_failed=1
+colorize yellow "Could not restore runtime value: $key"
+fi
+done < "$NETTUNE_VALUES_FILE"
+systemctl daemon-reexec 2>/dev/null || true
+
+local archive_dir
+archive_dir="${config_dir}/.backups/network-tune.rollback.$(date +%Y%m%d%H%M%S)"
+mkdir -p "$(dirname "$archive_dir")"
+if [[ "$restore_failed" == "0" ]]; then
+mv -- "$NETTUNE_STATE_DIR" "$archive_dir"
+printf '%s\n' "$archive_dir" > "$NETTUNE_LAST_BACKUP_FILE"
+colorize green "Optimization rolled back to the exact saved values. Snapshot archived at: $archive_dir"
+else
+colorize yellow "Rollback was partial. State was kept at $NETTUNE_STATE_DIR so it can be retried."
+return 1
+fi
 }

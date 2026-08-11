@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2154 # config_dir/service_dir are provided by tunnel-manager.sh.
 # Rathole tunnel core. Mirrors the Backhaul core's workflow (configure/edit/
 # diagnostics/benchmark/backup/watchdog/uninstall) but generates rathole's own
 # TOML dialect and manages its own binary/services, entirely separate from
@@ -16,6 +17,7 @@
 # rewrite — see core_rathole_generate_config.
 
 RATHOLE_REPO="rathole-org/rathole"
+RATHOLE_VERSION="v0.5.0"
 RATHOLE_DIR="${config_dir}/rathole"
 RATHOLE_BIN="${RATHOLE_DIR}/rathole_bin"
 
@@ -28,11 +30,17 @@ core_rathole_install() {
 [[ -f "$RATHOLE_BIN" ]] && return 0
 mkdir -p "$RATHOLE_DIR"
 colorize yellow "Installing Rathole..."
-local arch asset
+local arch asset expected_hash
 arch=$(uname -m)
 case "$arch" in
-x86_64) asset="rathole-x86_64-unknown-linux-gnu.zip" ;;
-aarch64|arm64) asset="rathole-aarch64-unknown-linux-musl.zip" ;;
+x86_64)
+asset="rathole-x86_64-unknown-linux-gnu.zip"
+expected_hash="3e7d0d0f365120cd3cd351d147d1a12ee960c8068b464d4dd533a3821873b80e"
+;;
+aarch64|arm64)
+asset="rathole-aarch64-unknown-linux-musl.zip"
+expected_hash="fa4a6fc63d86f8f1faa7c103a845e4715ce79a048455c0eec897b27237576564"
+;;
 *)
 colorize red "Unsupported architecture for Rathole: ${arch}."
 press_key
@@ -48,14 +56,7 @@ colorize red "unzip is required to install Rathole but is not available."
 press_key
 return 1
 fi
-local latest_url tag
-latest_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${RATHOLE_REPO}/releases/latest" 2>/dev/null)
-tag="${latest_url##*/}"
-if [[ -z "$tag" ]]; then
-colorize red "Could not determine the latest Rathole release."
-press_key
-return 1
-fi
+local tag="$RATHOLE_VERSION"
 local dl_url="https://github.com/${RATHOLE_REPO}/releases/download/${tag}/${asset}"
 local tmp_dir
 tmp_dir=$(mktemp -d)
@@ -65,7 +66,17 @@ rm -rf "$tmp_dir"
 press_key
 return 1
 fi
-unzip -o -q "${tmp_dir}/rathole.zip" -d "$tmp_dir"
+if ! verify_sha256 "${tmp_dir}/rathole.zip" "$expected_hash" "Rathole ${tag}"; then
+rm -rf "$tmp_dir"
+press_key
+return 1
+fi
+if ! unzip -o -q "${tmp_dir}/rathole.zip" -d "$tmp_dir"; then
+colorize red "Verified Rathole archive could not be extracted."
+rm -rf "$tmp_dir"
+press_key
+return 1
+fi
 if [[ ! -f "${tmp_dir}/rathole" ]]; then
 colorize red "Downloaded archive did not contain the expected 'rathole' binary."
 rm -rf "$tmp_dir"
@@ -76,14 +87,15 @@ local tmp_bin
 tmp_bin=$(mktemp "${RATHOLE_DIR}/.rathole_bin.XXXXXX")
 cp "${tmp_dir}/rathole" "$tmp_bin"
 chmod +x "$tmp_bin"
-mv -f "$tmp_bin" "$RATHOLE_BIN"
-rm -rf "$tmp_dir"
-if ! "$RATHOLE_BIN" --help &> /dev/null; then
+if ! "$tmp_bin" --help &> /dev/null; then
 colorize red "Rathole binary failed a basic sanity check (--help)."
-rm -f "$RATHOLE_BIN"
+rm -f "$tmp_bin"
+rm -rf "$tmp_dir"
 press_key
 return 1
 fi
+mv -f "$tmp_bin" "$RATHOLE_BIN"
+rm -rf "$tmp_dir"
 colorize green "✔ Rathole ${tag} installed."
 }
 
@@ -139,11 +151,11 @@ local section
 {
 echo "[$section]"
 if [[ "$mode" == "server" ]]; then
-echo "bind_addr = \"${ctrl_addr}\""
+echo "bind_addr = $(toml_quote "$ctrl_addr")"
 else
-echo "remote_addr = \"${ctrl_addr}\""
+echo "remote_addr = $(toml_quote "$ctrl_addr")"
 fi
-echo "default_token = \"${token}\""
+echo "default_token = $(toml_quote "$token")"
 echo ""
 # Transport defaults to plain tcp. To add tls/noise later: emit a
 # "[${section}.transport]" block here based on a transport arg, following
@@ -170,7 +182,8 @@ local type="$1" port="$2" config_file="$3" mode="$4"
 local flag
 [[ "$mode" == "server" ]] && flag="-s" || flag="-c"
 local service_file="${service_dir}/rathole-${type}${port}.service"
-local desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
+local desc_type
+desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
 cat > "$service_file" <<EOF
 [Unit]
 Description=Rathole $desc_type Port $port
@@ -190,13 +203,13 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now "rathole-${type}${port}.service" >/dev/null 2>&1
+enable_service_checked "rathole-${type}${port}.service"
 }
 
 core_rathole_configure() {
 local mode="$1"
 local existing_config="$2"
+TUNNEL_LAST_CONFIG_PATH=""
 local default_ctrl_addr="" default_token="" default_ports="" default_peer_ip="" default_peer_ssh_port="22"
 local old_config_name=""
 if [[ -n "$existing_config" && -f "$existing_config" ]]; then
@@ -259,6 +272,16 @@ fi
 
 local ctrl_port prefix config_name config_path
 ctrl_port="${ctrl_addr##*:}"
+if ! validate_port_number "$ctrl_port"; then
+colorize red "Invalid control port: ${ctrl_port}"
+press_key
+return 1
+fi
+if ! validate_port_list_csv "$ports_csv" false; then
+colorize red "Forwarded ports must be comma-separated numbers between 1 and 65535."
+press_key
+return 1
+fi
 [[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
 config_name="${prefix}${ctrl_port}"
 config_path="${RATHOLE_DIR}/${config_name}.toml"
@@ -268,12 +291,31 @@ colorize red "A Rathole tunnel already uses control port ${ctrl_port} on this si
 press_key
 return 1
 fi
+TUNNEL_LAST_CONFIG_PATH="$config_path"
 
 core_rathole_generate_config "$mode" "$config_path" "$ctrl_addr" "$token" "$ports_csv"
-core_rathole_create_service "$prefix" "$ctrl_port" "$config_path" "$mode"
-
+if [[ "$mode" == "server" ]]; then
+tm_firewall_close_owner "rathole:${config_name}:control"
+if ! tm_firewall_open_port "rathole:${config_name}:control" "$ctrl_port" tcp ||
+! tm_firewall_sync_mapping "rathole:${config_name}:forward" "$ports_csv" "tcp" false; then
+tm_firewall_close_owner "rathole:${config_name}:control"
+tm_firewall_close_owner "rathole:${config_name}:forward"
+rm -f "$config_path"
+return 1
+fi
+fi
+if ! core_rathole_create_service "$prefix" "$ctrl_port" "$config_path" "$mode"; then
+tm_firewall_close_owner "rathole:${config_name}:control"
+tm_firewall_close_owner "rathole:${config_name}:forward"
+rm -f "$config_path" "${service_dir}/rathole-${config_name}.service"
+systemctl daemon-reload
+colorize red "Rathole service failed to start. Check: journalctl -eu rathole-${config_name}.service"
+return 1
+fi
 if [[ -n "$old_config_name" && "${old_config_name}" != "rathole-${config_name}" ]]; then
 local old_service="rathole-${old_config_name#rathole-}.service"
+tm_firewall_close_owner "rathole:${old_config_name#rathole-}:control"
+tm_firewall_close_owner "rathole:${old_config_name#rathole-}:forward"
 systemctl disable --now "$old_service" >/dev/null 2>&1
 rm -f "${service_dir}/${old_service}"
 systemctl daemon-reload
@@ -465,22 +507,30 @@ service_path="${service_dir}/${service_name}"
 local backup_dir
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "rathole-${config_name}")
 colorize green "Current config backed up: $backup_dir"
-core_rathole_configure "$mode" "$config_path"
-local new_service_name
-new_service_name="rathole-$(basename "${config_path%.toml}").service"
-if [[ ! -f "$config_path" ]]; then
-new_service_name="$service_name"
-fi
+local configure_ok="true"
+core_rathole_configure "$mode" "$config_path" || configure_ok="false"
+local new_config_path="${TUNNEL_LAST_CONFIG_PATH:-$config_path}" new_service_name new_config_name
+new_config_name=$(basename "${new_config_path%.toml}")
+new_service_name="rathole-${new_config_name}.service"
 sleep 2
-if systemctl is-active --quiet "$new_service_name" 2>/dev/null; then
+if [[ "$configure_ok" == "true" ]] && systemctl is-active --quiet "$new_service_name" 2>/dev/null; then
 colorize green "✔ Rathole tunnel is healthy after edit."
 rm -rf "$backup_dir"
 else
 colorize red "✘ Service failed to come back up! Rolling back..."
 systemctl disable --now "$new_service_name" >/dev/null 2>&1
-rm -f "${service_dir}/${new_service_name}" "$config_path"
+rm -f "${service_dir}/${new_service_name}" "$new_config_path" "$(tunnel_meta_file "rathole-${new_config_name}")"
 systemctl daemon-reload
 restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
+tm_firewall_close_owner "rathole:${new_config_name}:control"
+tm_firewall_close_owner "rathole:${new_config_name}:forward"
+if [[ "$role" == "server" ]]; then
+local old_ctrl old_ports
+old_ctrl=$(toml_get "$config_path" server bind_addr); old_ctrl="${old_ctrl##*:}"
+old_ports=$(core_rathole_list_service_ports "$config_path" server | paste -sd, -)
+tm_firewall_open_port "rathole:${config_name}:control" "$old_ctrl" tcp
+tm_firewall_sync_mapping "rathole:${config_name}:forward" "$old_ports" tcp false
+fi
 if systemctl is-active --quiet "$service_name"; then
 colorize green "✔ Rollback succeeded, tunnel restored to its previous state."
 else
@@ -501,6 +551,8 @@ local config_name service_name service_path
 config_name=$(basename "${config_path%.toml}")
 service_name="rathole-${config_name}.service"
 service_path="${service_dir}/${service_name}"
+tm_firewall_close_owner "rathole:${config_name}:control"
+tm_firewall_close_owner "rathole:${config_name}:forward"
 [[ -f "$config_path" ]] && rm -f "$config_path"
 if [[ -f "$service_path" ]]; then
 systemctl is-active --quiet "$service_name" && systemctl disable --now "$service_name" >/dev/null 2>&1
@@ -531,10 +583,7 @@ for config_path in "${RATHOLE_DIR}"/{iran,kharej}*.toml; do
 [[ -f "$config_path" ]] || continue
 config_name=$(basename "${config_path%.toml}")
 service_name="rathole-${config_name}.service"
-if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
-logger -t rathole-watchdog "${service_name} is inactive, restarting" 2>/dev/null
-systemctl restart "$service_name" 2>/dev/null
-fi
+watchdog_restart_if_enabled "$service_name" "rathole-watchdog"
 done
 }
 

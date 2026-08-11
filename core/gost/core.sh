@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2154 # config_dir/service_dir are provided by tunnel-manager.sh.
 # GOST subsystem — deliberately NOT shaped like the Backhaul/Rathole cores.
 #
 # Backhaul and Rathole are "one config = one systemd service = one tunnel".
@@ -40,10 +41,39 @@ GOST_SERVICES_DIR="${GOST_DIR}/services.d"
 GOST_CHAINS_DIR="${GOST_DIR}/chains.d"
 GOST_META_DIR="${GOST_DIR}/.meta"
 GOST_SERVICE_NAME="gost.service"
+GOST_TXN_DIR=""
+GOST_TXN_SERVICE_EXISTED="false"
 
 GOST_HANDLER_TYPES=(tcp udp rtcp rudp http socks5 relay)
 GOST_TRANSPORT_TYPES=(tcp tls ws wss quic kcp grpc h2)
 GOST_SELECTOR_STRATEGIES=(round random fifo)
+
+gost_validate_name() {
+[[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$ ]]
+}
+gost_begin_change() {
+GOST_TXN_DIR=$(mktemp -d "${GOST_DIR}/.transaction.XXXXXX") || return 1
+[[ -f "${service_dir}/${GOST_SERVICE_NAME}" ]] && GOST_TXN_SERVICE_EXISTED="true" || GOST_TXN_SERVICE_EXISTED="false"
+mkdir -p "${GOST_TXN_DIR}/services.d" "${GOST_TXN_DIR}/chains.d" "${GOST_TXN_DIR}/meta"
+cp -a "${GOST_SERVICES_DIR}/." "${GOST_TXN_DIR}/services.d/" 2>/dev/null || true
+cp -a "${GOST_CHAINS_DIR}/." "${GOST_TXN_DIR}/chains.d/" 2>/dev/null || true
+cp -a "${GOST_META_DIR}/." "${GOST_TXN_DIR}/meta/" 2>/dev/null || true
+[[ -f "$GOST_CONFIG" ]] && cp -p "$GOST_CONFIG" "${GOST_TXN_DIR}/gost.yaml"
+}
+gost_finish_change() {
+local result="$1"
+[[ -n "$GOST_TXN_DIR" && -d "$GOST_TXN_DIR" ]] || return 0
+if [[ "$result" == "rollback" ]]; then
+rm -rf "$GOST_SERVICES_DIR" "$GOST_CHAINS_DIR" "$GOST_META_DIR"
+mkdir -p "$GOST_SERVICES_DIR" "$GOST_CHAINS_DIR" "$GOST_META_DIR"
+cp -a "${GOST_TXN_DIR}/services.d/." "$GOST_SERVICES_DIR/" 2>/dev/null || true
+cp -a "${GOST_TXN_DIR}/chains.d/." "$GOST_CHAINS_DIR/" 2>/dev/null || true
+cp -a "${GOST_TXN_DIR}/meta/." "$GOST_META_DIR/" 2>/dev/null || true
+if [[ -f "${GOST_TXN_DIR}/gost.yaml" ]]; then cp -p "${GOST_TXN_DIR}/gost.yaml" "$GOST_CONFIG"; else rm -f "$GOST_CONFIG"; fi
+fi
+rm -rf "$GOST_TXN_DIR"
+GOST_TXN_DIR=""
+}
 
 core_gost_ensure_ready() {
 mkdir -p "$GOST_DIR" "$GOST_SERVICES_DIR" "$GOST_CHAINS_DIR" "$GOST_META_DIR"
@@ -75,6 +105,7 @@ return 1
 fi
 version="${tag#v}"
 local dl_url="https://github.com/${GOST_REPO}/releases/download/${tag}/gost_${version}_${asset}.tar.gz"
+local checksums_url="https://github.com/${GOST_REPO}/releases/download/${tag}/checksums.txt"
 local tmp_dir
 tmp_dir=$(mktemp -d)
 if ! curl -fsSL "$dl_url" -o "${tmp_dir}/gost.tar.gz"; then
@@ -83,7 +114,19 @@ rm -rf "$tmp_dir"
 press_key
 return 1
 fi
-tar -xzf "${tmp_dir}/gost.tar.gz" -C "$tmp_dir"
+local expected_hash
+expected_hash=$(curl -fsSL "$checksums_url" 2>/dev/null | awk -v name="gost_${version}_${asset}.tar.gz" '$2==name || $2=="*"name {print $1; exit}')
+if ! verify_sha256 "${tmp_dir}/gost.tar.gz" "$expected_hash" "GOST ${tag}"; then
+rm -rf "$tmp_dir"
+press_key
+return 1
+fi
+if ! tar -xzf "${tmp_dir}/gost.tar.gz" -C "$tmp_dir"; then
+colorize red "Verified GOST archive could not be extracted."
+rm -rf "$tmp_dir"
+press_key
+return 1
+fi
 if [[ ! -f "${tmp_dir}/gost" ]]; then
 colorize red "Downloaded archive did not contain the expected 'gost' binary."
 rm -rf "$tmp_dir"
@@ -94,22 +137,21 @@ local tmp_bin
 tmp_bin=$(mktemp "${GOST_DIR}/.gost_bin.XXXXXX")
 cp "${tmp_dir}/gost" "$tmp_bin"
 chmod +x "$tmp_bin"
-mv -f "$tmp_bin" "$GOST_BIN"
-rm -rf "$tmp_dir"
-if ! "$GOST_BIN" -V &> /dev/null; then
+if ! "$tmp_bin" -V &> /dev/null; then
 colorize red "GOST binary failed a basic sanity check (-V)."
-rm -f "$GOST_BIN"
+rm -f "$tmp_bin"
+rm -rf "$tmp_dir"
 press_key
 return 1
 fi
+mv -f "$tmp_bin" "$GOST_BIN"
+rm -rf "$tmp_dir"
 colorize green "✔ GOST ${tag} installed."
 }
 
 # Generic, registry-driven picker: prompts with a default, validates against
 # an arbitrary list of allowed values, writes the result into $3 by name
-# (same indirect-assignment convention as prompt_with_default/prompt_boolean
-# elsewhere in this codebase, so it composes with them and never leaks its
-# own prompt output into a command-substitution capture).
+# (same safe indirect-assignment convention as prompt_with_default).
 gost_pick_from_list() {
 local label="$1" default="$2" var_name="$3"
 shift 3
@@ -120,7 +162,11 @@ while true; do
 prompt_with_default "$label" "$default" input
 input="${input,,}"
 if [[ " ${choices[*]} " == *" ${input} "* ]]; then
-eval "$var_name=\"\$input\""
+if [[ ! "$var_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+colorize red "Invalid internal variable target: $var_name"
+return 1
+fi
+printf -v "$var_name" '%s' "$input"
 return 0
 fi
 colorize red "Invalid choice. Pick one of: ${choices[*]}"
@@ -172,8 +218,6 @@ done
 }
 
 gost_apply_and_restart() {
-local backup_dir
-backup_dir=$(backup_tunnel "$GOST_CONFIG" "${service_dir}/${GOST_SERVICE_NAME}" "gost")
 gost_rebuild_config
 if [[ ! -f "${service_dir}/${GOST_SERVICE_NAME}" ]]; then
 core_gost_create_service
@@ -182,12 +226,20 @@ systemctl restart "$GOST_SERVICE_NAME"
 sleep 2
 if systemctl is-active --quiet "$GOST_SERVICE_NAME"; then
 colorize green "✔ Applied and gost.service is healthy."
-rm -rf "$backup_dir"
+gost_finish_change commit
 return 0
 else
 colorize red "✘ gost.service failed to come back up! Rolling back..."
-restore_tunnel_backup "$backup_dir" "$GOST_CONFIG" "${service_dir}/${GOST_SERVICE_NAME}" "$GOST_SERVICE_NAME"
-if systemctl is-active --quiet "$GOST_SERVICE_NAME"; then
+local service_existed="$GOST_TXN_SERVICE_EXISTED"
+gost_finish_change rollback
+if [[ "$service_existed" == "true" ]]; then
+systemctl restart "$GOST_SERVICE_NAME" 2>/dev/null
+else
+systemctl disable --now "$GOST_SERVICE_NAME" >/dev/null 2>&1
+rm -f "${service_dir}/${GOST_SERVICE_NAME}"
+systemctl daemon-reload
+fi
+if [[ "$service_existed" != "true" ]] || systemctl is-active --quiet "$GOST_SERVICE_NAME"; then
 colorize green "✔ Rollback succeeded."
 else
 colorize red "✘ Rollback also failed! Check logs manually: journalctl -eu ${GOST_SERVICE_NAME}"
@@ -217,7 +269,7 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now "$GOST_SERVICE_NAME" >/dev/null 2>&1
+systemctl enable "$GOST_SERVICE_NAME" >/dev/null 2>&1
 }
 
 gost_generate_service_fragment() {
@@ -248,7 +300,7 @@ for node in "${nodes[@]}"; do
 node="${node// /}"
 [[ -z "$node" ]] && continue
 echo "    - name: ${name}-${i}"
-echo "      addr: \"${node}\""
+echo "      addr: $(yaml_quote "$node")"
 ((i++))
 done
 if (( i > 1 )); then
@@ -345,6 +397,11 @@ colorize yellow "and Chains from the GOST Manager menu instead."
 echo ""
 local name proto listen_port targets_csv
 prompt_with_default "Service name" "quickfwd$((RANDOM % 1000))" name
+if ! gost_validate_name "$name"; then
+colorize red "Service names may contain only letters, numbers, dot, underscore and dash (max 64)."
+press_key
+return 1
+fi
 if [[ -f "${GOST_SERVICES_DIR}/${name}.yaml" ]]; then
 colorize red "A GOST service named '${name}' already exists."
 press_key
@@ -361,8 +418,14 @@ colorize red "At least one target is required."
 press_key
 return 1
 fi
+validate_port_number "$listen_port" || { colorize red "Invalid listen port."; press_key; return 1; }
+validate_host_port_csv "$targets_csv" || { colorize red "Targets must use host:port (comma-separated)."; press_key; return 1; }
+gost_begin_change || return 1
 gost_generate_service_fragment "$name" "$proto" "$proto" ":${listen_port}" "" "$targets_csv" "round"
-gost_apply_and_restart
+if gost_apply_and_restart; then
+tm_firewall_close_owner "gost:${name}"
+tm_firewall_open_port "gost:${name}" "$listen_port" "$proto"
+fi
 echo ""
 press_key
 }
@@ -374,6 +437,11 @@ colorize cyan "GOST Service — advanced" bold
 echo ""
 local name handler_type listener_type addr chain_name targets_csv strategy
 prompt_with_default "Service name" "svc$((RANDOM % 1000))" name
+if ! gost_validate_name "$name"; then
+colorize red "Invalid service name. Use letters, numbers, dot, underscore or dash only."
+press_key
+return 1
+fi
 if [[ -f "${GOST_SERVICES_DIR}/${name}.yaml" ]]; then
 colorize red "A GOST service named '${name}' already exists. Use Edit instead."
 press_key
@@ -407,9 +475,22 @@ if [[ "$targets_csv" == *,* ]]; then
 gost_pick_from_list "Load-balancing strategy" "round" strategy "${GOST_SELECTOR_STRATEGIES[@]}"
 fi
 
+if [[ -n "$targets_csv" ]] && ! validate_host_port_csv "$targets_csv"; then
+colorize red "Targets must use host:port (comma-separated)."
+press_key
+return 1
+fi
+
+local listen_port="${addr##*:}" listen_proto="tcp"
+validate_listen_address "$addr" || { colorize red "Invalid listen address/port."; press_key; return 1; }
+[[ "$listener_type" == "quic" || "$listener_type" == "kcp" ]] && listen_proto="udp"
+gost_begin_change || return 1
 gost_generate_service_fragment "$name" "$handler_type" "$listener_type" "$addr" "$chain_name" "$targets_csv" "$strategy"
 gost_meta_set "$name" "handler_type" "$handler_type"
-gost_apply_and_restart
+if gost_apply_and_restart; then
+tm_firewall_close_owner "gost:${name}"
+tm_firewall_open_port "gost:${name}" "$listen_port" "$listen_proto"
+fi
 echo ""
 press_key
 }
@@ -459,6 +540,11 @@ echo ""
 
 local name tun_net tun_mtu tun_dns
 prompt_with_default "TUN device name" "tungo0" name
+if ! gost_validate_name "$name"; then
+colorize red "Invalid TUN/service name."
+press_key
+return 1
+fi
 if [[ -f "${GOST_SERVICES_DIR}/${name}.yaml" ]]; then
 colorize red "A GOST service named '${name}' already exists."
 press_key
@@ -467,7 +553,13 @@ fi
 prompt_with_default "TUN network (CIDR)" "192.168.123.1/24" tun_net
 prompt_with_default "MTU" "1420" tun_mtu
 prompt_with_default "DNS server (optional)" "1.1.1.1" tun_dns
+if ! validate_cidr "$tun_net" || [[ ! "$tun_mtu" =~ ^[0-9]+$ ]] || (( tun_mtu < 576 || tun_mtu > 9000 )) || [[ ! "$tun_dns" =~ ^[a-zA-Z0-9._:-]*$ ]]; then
+colorize red "Invalid TUN CIDR, MTU (576-9000), or DNS value."
+press_key
+return 1
+fi
 
+gost_begin_change || return 1
 gost_generate_tungo_fragment "$name" "$chain_name" "$tun_net" "$tun_mtu" "$tun_dns" "$gateway_ip" "$gateway_iface"
 gost_meta_set "$name" "handler_type" "tungo"
 gost_apply_and_restart
@@ -479,8 +571,9 @@ press_key
 
 core_gost_remove_service() {
 local name="$1"
+gost_begin_change || return 1
 rm -f "${GOST_SERVICES_DIR}/${name}.yaml" "${GOST_META_DIR}/${name}.conf"
-gost_apply_and_restart
+if gost_apply_and_restart; then tm_firewall_close_owner "gost:${name}"; fi
 }
 
 core_gost_service_menu() {
@@ -534,6 +627,11 @@ colorize yellow "(dialer) — this is GOST's actual chaining/flexibility feature
 echo ""
 local name
 prompt_with_default "Chain name" "chain$((RANDOM % 1000))" name
+if ! gost_validate_name "$name"; then
+colorize red "Invalid chain name. Use letters, numbers, dot, underscore or dash only."
+press_key
+return 1
+fi
 if [[ -f "${GOST_CHAINS_DIR}/${name}.yaml" ]]; then
 colorize red "A chain named '${name}' already exists. Use Edit instead."
 press_key
@@ -548,6 +646,7 @@ rm -f "$hops_file"
 press_key
 return 1
 fi
+gost_begin_change || { rm -f "$hops_file"; return 1; }
 gost_generate_chain_fragment "$name" "$hops_file"
 mv -f "$hops_file" "${GOST_META_DIR}/${name}.hops"
 gost_apply_and_restart
@@ -580,8 +679,8 @@ case "$choice" in
 a)
 local hop_addr hop_connector hop_dialer
 prompt_with_default "Hop address (host:port)" "" hop_addr
-if [[ -z "$hop_addr" ]]; then
-colorize red "Address required."; sleep 1; continue
+if ! validate_host_port "$hop_addr"; then
+colorize red "A valid host:port address is required."; sleep 1; continue
 fi
 gost_pick_from_list "Connector (protocol for this hop)" "relay" hop_connector "${GOST_HANDLER_TYPES[@]}"
 gost_pick_from_list "Dialer (transport for this hop)" "tcp" hop_dialer "${GOST_TRANSPORT_TYPES[@]}"
@@ -607,6 +706,7 @@ done
 
 core_gost_remove_chain() {
 local name="$1"
+gost_begin_change || return 1
 rm -f "${GOST_CHAINS_DIR}/${name}.yaml" "${GOST_META_DIR}/${name}.hops"
 gost_apply_and_restart
 }
@@ -688,13 +788,12 @@ press_key
 
 core_gost_watchdog_check() {
 [[ -f "$GOST_CONFIG" ]] || return 0
-if ! systemctl is-active --quiet "$GOST_SERVICE_NAME" 2>/dev/null; then
-logger -t gost-watchdog "${GOST_SERVICE_NAME} is inactive, restarting" 2>/dev/null
-systemctl restart "$GOST_SERVICE_NAME" 2>/dev/null
-fi
+watchdog_restart_if_enabled "$GOST_SERVICE_NAME" "gost-watchdog"
 }
 
 core_gost_destroy_all() {
+local service
+while read -r service; do [[ -n "$service" ]] && tm_firewall_close_owner "gost:${service}"; done < <(core_gost_list_services)
 systemctl disable --now "$GOST_SERVICE_NAME" >/dev/null 2>&1
 rm -f "${service_dir}/${GOST_SERVICE_NAME}"
 systemctl daemon-reload

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2154 # config_dir/service_dir are provided by tunnel-manager.sh.
 # FRP tunnel core. Mirrors Rathole/Hysteria2's workflow (configure/edit/
 # diagnostics/benchmark/backup/watchdog/uninstall) but drives FRP's own two
 # separate binaries (frps for server, frpc for client) and TOML dialect.
@@ -88,9 +89,17 @@ press_key
 return 1
 fi
 else
-colorize yellow "Warning: could not fetch the release checksum; installing unverified."
+colorize red "Could not fetch the FRP release checksum; refusing an unverified install."
+rm -rf "$tmp_dir"
+press_key
+return 1
 fi
-tar -xzf "${tmp_dir}/frp.tar.gz" -C "$tmp_dir"
+if ! tar -xzf "${tmp_dir}/frp.tar.gz" -C "$tmp_dir"; then
+colorize red "Verified FRP archive could not be extracted."
+rm -rf "$tmp_dir"
+press_key
+return 1
+fi
 if [[ ! -f "${tmp_dir}/${pkg}/frps" || ! -f "${tmp_dir}/${pkg}/frpc" ]]; then
 colorize red "Downloaded archive did not contain the expected frps/frpc binaries."
 rm -rf "$tmp_dir"
@@ -170,9 +179,9 @@ END { if (name!="") print name, type, lport, rport }
 ' "$1" 2>/dev/null
 }
 frp_proxies_csv() {
-local file="$1" name type lport rport
+local file="$1" type lport rport
 local -a out=()
-while read -r name type lport rport; do
+while read -r _ type lport rport; do
 [[ -z "$rport" ]] && continue
 if [[ "$rport" == "$lport" ]]; then out+=("$rport"); else out+=("${rport}=${lport}"); fi
 done < <(frp_list_proxies "$file")
@@ -212,19 +221,19 @@ echo "bindPort = ${port}"
 echo ""
 echo "[auth]"
 echo "method = \"token\""
-echo "token = \"${token}\""
+echo "token = $(toml_quote "$token")"
 } > "$output_file"
 }
 
 core_frp_generate_client_config() {
 local output_file="$1" server_ip="$2" server_port="$3" token="$4" ports_csv="$5"
 {
-echo "serverAddr = \"${server_ip}\""
+echo "serverAddr = $(toml_quote "$server_ip")"
 echo "serverPort = ${server_port}"
 echo ""
 echo "[auth]"
 echo "method = \"token\""
-echo "token = \"${token}\""
+echo "token = $(toml_quote "$token")"
 local -a entries=()
 IFS=',' read -r -a entries <<< "$ports_csv"
 local entry remote local_port i=0
@@ -249,7 +258,8 @@ local type="$1" port="$2" config_file="$3" mode="$4"
 local bin sub_desc
 if [[ "$mode" == "server" ]]; then bin="$FRP_SERVER_BIN"; sub_desc="frps"; else bin="$FRP_CLIENT_BIN"; sub_desc="frpc"; fi
 local service_file="${service_dir}/frp-${type}${port}.service"
-local desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
+local desc_type
+desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
 cat > "$service_file" <<EOF
 [Unit]
 Description=FRP (${sub_desc}) $desc_type Port $port
@@ -269,13 +279,13 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now "frp-${type}${port}.service" >/dev/null 2>&1
+enable_service_checked "frp-${type}${port}.service"
 }
 
 core_frp_configure() {
 local mode="$1"
 local existing_config="$2"
+TUNNEL_LAST_CONFIG_PATH=""
 local default_ctrl_addr="" default_token="" default_ports="" default_peer_ip="" default_peer_ssh_port="22"
 local old_config_name=""
 if [[ -n "$existing_config" && -f "$existing_config" ]]; then
@@ -288,6 +298,7 @@ default_token=$(toml_get "$existing_config" "auth" "token")
 default_ports=$(frp_proxies_csv "$existing_config")
 fi
 old_config_name=$(core_frp_config_name "$existing_config")
+[[ "$mode" == "server" ]] && default_ports=$(read_tunnel_meta "$old_config_name" "forward_ports")
 default_peer_ip=$(read_tunnel_meta "$old_config_name" "peer_ip")
 default_peer_ssh_port=$(read_tunnel_meta "$old_config_name" "peer_ssh_port")
 [[ -z "$default_peer_ssh_port" ]] && default_peer_ssh_port="22"
@@ -316,12 +327,12 @@ local generated_token
 generated_token=$(head -c16 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c20)
 prompt_with_default "Auth Token (must match on both sides)" "${default_token:-$generated_token}" token
 
-if [[ "$mode" == "client" ]]; then
 echo ""
 colorize green "Supported formats:"
 echo "  1. 443           - open port 443 on IRAN, forward to the same local port"
 echo "  2. 443=5000      - open port 443 on IRAN, forward to local port 5000"
 echo "  3. 443,8080=9090 - multiple, comma-separated"
+[[ "$mode" == "server" ]] && colorize yellow "Enter the same public port mappings that will be configured on the KHAREJ client."
 echo ""
 prompt_with_default "Ports to forward (comma-separated)" "$default_ports" ports_csv
 if [[ -z "$ports_csv" ]]; then
@@ -329,6 +340,10 @@ colorize red "At least one port is required."
 press_key
 return 1
 fi
+if ! validate_port_mapping_csv "$ports_csv" false; then
+colorize red "Invalid port mapping. Use forms such as 443 or 443=5000."
+press_key
+return 1
 fi
 
 echo ""
@@ -345,6 +360,11 @@ fi
 
 local ctrl_port prefix config_name config_path
 ctrl_port="${ctrl_addr##*:}"
+if ! validate_port_number "$ctrl_port"; then
+colorize red "Invalid FRP control port: ${ctrl_port}"
+press_key
+return 1
+fi
 [[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
 config_name="${prefix}${ctrl_port}"
 config_path="${FRP_DIR}/${config_name}.toml"
@@ -354,16 +374,33 @@ colorize red "An FRP tunnel already uses port ${ctrl_port} on this side. Choose 
 press_key
 return 1
 fi
+TUNNEL_LAST_CONFIG_PATH="$config_path"
 
 if [[ "$mode" == "server" ]]; then
 core_frp_generate_server_config "$config_path" "$ctrl_port" "$token"
+tm_firewall_close_owner "frp:${config_name}:control"
+if ! tm_firewall_open_port "frp:${config_name}:control" "$ctrl_port" tcp ||
+! tm_firewall_sync_mapping "frp:${config_name}:forward" "$ports_csv" "tcp" false; then
+tm_firewall_close_owner "frp:${config_name}:control"
+tm_firewall_close_owner "frp:${config_name}:forward"
+rm -f "$config_path"
+return 1
+fi
 else
 core_frp_generate_client_config "$config_path" "${ctrl_addr%%:*}" "${ctrl_addr##*:}" "$token" "$ports_csv"
 fi
-core_frp_create_service "$prefix" "$ctrl_port" "$config_path" "$mode"
-
+if ! core_frp_create_service "$prefix" "$ctrl_port" "$config_path" "$mode"; then
+tm_firewall_close_owner "frp:${config_name}:control"
+tm_firewall_close_owner "frp:${config_name}:forward"
+rm -f "$config_path" "${service_dir}/frp-${config_name}.service"
+systemctl daemon-reload
+colorize red "FRP service failed to start. Check: journalctl -eu frp-${config_name}.service"
+return 1
+fi
 if [[ -n "$old_config_name" && "${old_config_name}" != "frp-${config_name}" ]]; then
 local old_service="frp-${old_config_name#frp-}.service"
+tm_firewall_close_owner "frp:${old_config_name#frp-}:control"
+tm_firewall_close_owner "frp:${old_config_name#frp-}:forward"
 systemctl disable --now "$old_service" >/dev/null 2>&1
 rm -f "${service_dir}/${old_service}"
 systemctl daemon-reload
@@ -373,7 +410,7 @@ fi
 save_last_used "transport_type" "frp"
 [[ "$mode" == "client" ]] && save_last_used "client_remote_addr" "$ctrl_addr"
 save_last_used "peer_ip" "$peer_ip"
-write_tunnel_meta "frp-${config_name}" "$peer_ip" "${peer_ssh_port:-22}"
+write_tunnel_meta "frp-${config_name}" "$peer_ip" "${peer_ssh_port:-22}" "$ports_csv"
 ensure_watchdog_installed
 ensure_journal_limits
 echo ""
@@ -558,22 +595,30 @@ service_path="${service_dir}/${service_name}"
 local backup_dir
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "frp-${config_name}")
 colorize green "Current config backed up: $backup_dir"
-core_frp_configure "$mode" "$config_path"
-local new_service_name
-new_service_name="frp-$(basename "${config_path%.toml}").service"
-if [[ ! -f "$config_path" ]]; then
-new_service_name="$service_name"
-fi
+local configure_ok="true"
+core_frp_configure "$mode" "$config_path" || configure_ok="false"
+local new_config_path="${TUNNEL_LAST_CONFIG_PATH:-$config_path}" new_service_name new_config_name
+new_config_name=$(basename "${new_config_path%.toml}")
+new_service_name="frp-${new_config_name}.service"
 sleep 2
-if systemctl is-active --quiet "$new_service_name" 2>/dev/null; then
+if [[ "$configure_ok" == "true" ]] && systemctl is-active --quiet "$new_service_name" 2>/dev/null; then
 colorize green "✔ FRP tunnel is healthy after edit."
 rm -rf "$backup_dir"
 else
 colorize red "✘ Service failed to come back up! Rolling back..."
 systemctl disable --now "$new_service_name" >/dev/null 2>&1
-rm -f "${service_dir}/${new_service_name}" "$config_path"
+rm -f "${service_dir}/${new_service_name}" "$new_config_path" "$(tunnel_meta_file "frp-${new_config_name}")"
 systemctl daemon-reload
 restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
+tm_firewall_close_owner "frp:${new_config_name}:control"
+tm_firewall_close_owner "frp:${new_config_name}:forward"
+if [[ "$role" == "server" ]]; then
+local old_ctrl old_ports
+old_ctrl=$(frp_get_bind_port "$config_path")
+old_ports=$(read_tunnel_meta "frp-${config_name}" "forward_ports")
+tm_firewall_open_port "frp:${config_name}:control" "$old_ctrl" tcp
+tm_firewall_sync_mapping "frp:${config_name}:forward" "$old_ports" tcp false
+fi
 if systemctl is-active --quiet "$service_name"; then
 colorize green "✔ Rollback succeeded, tunnel restored to its previous state."
 else
@@ -594,6 +639,8 @@ local config_name service_name service_path
 config_name=$(basename "${config_path%.toml}")
 service_name="frp-${config_name}.service"
 service_path="${service_dir}/${service_name}"
+tm_firewall_close_owner "frp:${config_name}:control"
+tm_firewall_close_owner "frp:${config_name}:forward"
 [[ -f "$config_path" ]] && rm -f "$config_path"
 if [[ -f "$service_path" ]]; then
 systemctl is-active --quiet "$service_name" && systemctl disable --now "$service_name" >/dev/null 2>&1
@@ -624,10 +671,7 @@ for config_path in "${FRP_DIR}"/{iran,kharej}*.toml; do
 [[ -f "$config_path" ]] || continue
 config_name=$(basename "${config_path%.toml}")
 service_name="frp-${config_name}.service"
-if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
-logger -t frp-watchdog "${service_name} is inactive, restarting" 2>/dev/null
-systemctl restart "$service_name" 2>/dev/null
-fi
+watchdog_restart_if_enabled "$service_name" "frp-watchdog"
 done
 }
 

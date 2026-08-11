@@ -1,0 +1,20 @@
+name: Shell tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n install.sh tunnel-manager.sh lib/*.sh core/*/*.sh tests/*.sh
+      - name: ShellCheck
+        run: shellcheck -x -S warning install.sh tunnel-manager.sh lib/*.sh core/*/*.sh tests/*.sh
+      - name: Unit tests
+        run: bash tests/test-core.sh

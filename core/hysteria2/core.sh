@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2154 # config_dir/service_dir are provided by tunnel-manager.sh.
 # Hysteria2 tunnel core. Mirrors Rathole's workflow (configure/edit/
 # diagnostics/benchmark/backup/watchdog/uninstall) but speaks Hysteria2's own
 # YAML config and runs over QUIC/UDP instead of plain TCP — the point of this
@@ -8,8 +9,8 @@
 # read_tunnel_last_test/ensure_watchdog_installed helpers — same layering
 # Rathole already relies on).
 #
-# Layout: ${config_dir}/hysteria2/hysteria2_bin, .../iranN.yaml (server),
-# .../kharejN.yaml (client). Services: hysteria2-iranN.service /
+# Layout: ${config_dir}/hysteria2/hysteria2_bin, .../iranN.yaml (client),
+# .../kharejN.yaml (server). Services: hysteria2-iranN.service /
 # hysteria2-kharejN.service. Config identity for the shared meta/status/
 # backup helpers is prefixed "hysteria2-" so it never collides with a
 # Backhaul or Rathole tunnel using the same port number.
@@ -19,12 +20,9 @@
 # below can extract values with plain grep/awk instead of a real YAML parser.
 # If you add a new field, keep that discipline or the getters silently break.
 #
-# The client always sets `tls: insecure: true`. Cert-pinning would need the
-# server's cert fingerprint copied over to the client's machine out of band —
-# Iran and Kharej are separate servers with separate panel installs, so
-# there's no in-panel channel to move that value automatically. The real
-# trust boundary here is the auth password (and obfs password, if enabled),
-# not certificate identity — same trust model Backhaul's own transports use.
+# The client uses a required SHA-256 certificate pin. It still sets
+# `insecure: true` because the shared certificate is self-signed, but the pin
+# restores server identity verification and prevents a password-stealing MITM.
 
 HYSTERIA2_REPO="apernet/hysteria"
 HYSTERIA2_DIR="${config_dir}/hysteria2"
@@ -83,7 +81,10 @@ press_key
 return 1
 fi
 else
-colorize yellow "Warning: could not fetch the release checksum; installing unverified."
+colorize red "Could not fetch the Hysteria2 release checksum; refusing an unverified install."
+rm -rf "$tmp_dir"
+press_key
+return 1
 fi
 chmod +x "${tmp_dir}/hysteria"
 if ! "${tmp_dir}/hysteria" --help &> /dev/null; then
@@ -135,24 +136,39 @@ hysteria2_get_listen_port() {
 grep '^listen:' "$1" 2>/dev/null | head -1 | awk '{print $2}' | sed 's/^://'
 }
 hysteria2_get_server_addr() {
-grep '^server:' "$1" 2>/dev/null | head -1 | cut -d' ' -f2-
+local value
+value=$(grep '^server:' "$1" 2>/dev/null | head -1 | cut -d' ' -f2-)
+yaml_unquote "$value"
 }
 hysteria2_get_auth_password() {
 local file="$1"
 if grep -q '^auth: ' "$file" 2>/dev/null; then
-grep '^auth: ' "$file" | head -1 | cut -d' ' -f2-
+local value
+value=$(grep '^auth: ' "$file" | head -1 | cut -d' ' -f2-)
+yaml_unquote "$value"
 else
-grep '^  password: ' "$file" 2>/dev/null | head -1 | sed 's/^  password: //'
+local value
+value=$(grep '^  password: ' "$file" 2>/dev/null | head -1 | sed 's/^  password: //')
+yaml_unquote "$value"
 fi
 }
 hysteria2_obfs_enabled() {
 grep -q '^obfs:' "$1" 2>/dev/null && echo "true" || echo "false"
 }
 hysteria2_get_obfs_password() {
-grep '^    password: ' "$1" 2>/dev/null | head -1 | sed 's/^    password: //'
+local value
+value=$(grep '^    password: ' "$1" 2>/dev/null | head -1 | sed 's/^    password: //')
+yaml_unquote "$value"
 }
 hysteria2_get_tls_sni() {
-grep '^  sni: ' "$1" 2>/dev/null | head -1 | sed 's/^  sni: //'
+local value
+value=$(grep '^  sni: ' "$1" 2>/dev/null | head -1 | sed 's/^  sni: //')
+yaml_unquote "$value"
+}
+hysteria2_get_tls_pin() {
+local value
+value=$(grep '^  pinSHA256: ' "$1" 2>/dev/null | head -1 | sed 's/^  pinSHA256: //')
+yaml_unquote "$value"
 }
 hysteria2_list_forwards() {
 awk '
@@ -192,8 +208,7 @@ echo "${addr##*:}"
 fi
 }
 core_hysteria2_suggest_free_port() {
-local mode="$1" prefix port=36712
-[[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
+local prefix="$1" port=36712
 while [[ -f "${HYSTERIA2_DIR}/${prefix}${port}.yaml" ]] || is_port_listening_system_wide "$port"; do
 ((port++))
 done
@@ -212,33 +227,34 @@ echo "  key: ${KEY_FILE}"
 echo ""
 echo "auth:"
 echo "  type: password"
-echo "  password: ${password}"
+echo "  password: $(yaml_quote "$password")"
 if [[ -n "$obfs_password" ]]; then
 echo ""
 echo "obfs:"
 echo "  type: salamander"
 echo "  salamander:"
-echo "    password: ${obfs_password}"
+echo "    password: $(yaml_quote "$obfs_password")"
 fi
 } > "$output_file"
 }
 
 core_hysteria2_generate_client_config() {
-local output_file="$1" server_addr="$2" password="$3" obfs_password="$4" sni="$5" ports_csv="$6"
+local output_file="$1" server_addr="$2" password="$3" obfs_password="$4" sni="$5" ports_csv="$6" cert_pin="$7"
 {
-echo "server: ${server_addr}"
+echo "server: $(yaml_quote "$server_addr")"
 echo ""
-echo "auth: ${password}"
+echo "auth: $(yaml_quote "$password")"
 echo ""
 echo "tls:"
-[[ -n "$sni" ]] && echo "  sni: ${sni}"
+[[ -n "$sni" ]] && echo "  sni: $(yaml_quote "$sni")"
 echo "  insecure: true"
+echo "  pinSHA256: $(yaml_quote "$cert_pin")"
 if [[ -n "$obfs_password" ]]; then
 echo ""
 echo "obfs:"
 echo "  type: salamander"
 echo "  salamander:"
-echo "    password: ${obfs_password}"
+echo "    password: $(yaml_quote "$obfs_password")"
 fi
 local -a entries=()
 IFS=',' read -r -a entries <<< "$ports_csv"
@@ -263,7 +279,8 @@ local type="$1" port="$2" config_file="$3" mode="$4"
 local sub_cmd
 [[ "$mode" == "server" ]] && sub_cmd="server" || sub_cmd="client"
 local service_file="${service_dir}/hysteria2-${type}${port}.service"
-local desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
+local desc_type
+desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
 cat > "$service_file" <<EOF
 [Unit]
 Description=Hysteria2 $desc_type Port $port
@@ -283,14 +300,19 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now "hysteria2-${type}${port}.service" >/dev/null 2>&1
+enable_service_checked "hysteria2-${type}${port}.service"
 }
 
 core_hysteria2_configure() {
 local mode="$1"
 local existing_config="$2"
-local default_ctrl_addr="" default_password="" default_obfs_password="" default_sni="" default_ports="" default_peer_ip="" default_peer_ssh_port="22"
+TUNNEL_LAST_CONFIG_PATH=""
+local side="${3:-}"
+if [[ -z "$side" && -n "$existing_config" ]]; then
+[[ "$(basename "$existing_config")" == iran* ]] && side="iran" || side="kharej"
+fi
+[[ -z "$side" ]] && { [[ "$mode" == "client" ]] && side="iran" || side="kharej"; }
+local default_ctrl_addr="" default_password="" default_obfs_password="" default_sni="" default_pin="" default_ports="" default_peer_ip="" default_peer_ssh_port="22"
 local old_config_name=""
 if [[ -n "$existing_config" && -f "$existing_config" ]]; then
 if [[ "$mode" == "server" ]]; then
@@ -300,6 +322,7 @@ else
 default_ctrl_addr=$(hysteria2_get_server_addr "$existing_config")
 default_password=$(hysteria2_get_auth_password "$existing_config")
 default_sni=$(hysteria2_get_tls_sni "$existing_config")
+default_pin=$(hysteria2_get_tls_pin "$existing_config")
 default_ports=$(hysteria2_forwards_csv "$existing_config")
 fi
 [[ "$(hysteria2_obfs_enabled "$existing_config")" == "true" ]] && default_obfs_password=$(hysteria2_get_obfs_password "$existing_config")
@@ -310,21 +333,21 @@ default_peer_ssh_port=$(read_tunnel_meta "$old_config_name" "peer_ssh_port")
 fi
 
 clear
-colorize cyan "Configuring Hysteria2 $([[ "$mode" == "server" ]] && echo "IRAN (Server)" || echo "KHAREJ (Client)")" bold
+colorize cyan "Configuring Hysteria2 $([[ "$side" == "iran" ]] && echo "IRAN (Client / public listener)" || echo "KHAREJ (Server / backend side)")" bold
 echo ""
 colorize magenta "Hysteria2 tunnels over QUIC (UDP) with optional obfuscation — useful when the link is filtered or throttled." normal
 echo ""
 
-local ctrl_addr password obfs_choice obfs_password sni ports_csv peer_ip peer_ssh_port
+local ctrl_addr password obfs_choice obfs_password sni cert_pin ports_csv peer_ip peer_ssh_port
 
 if [[ "$mode" == "server" ]]; then
 local suggested_port="${default_ctrl_addr#:}"
-[[ -z "$suggested_port" ]] && suggested_port=$(core_hysteria2_suggest_free_port "server")
+[[ -z "$suggested_port" ]] && suggested_port=$(core_hysteria2_suggest_free_port "$side")
 prompt_with_default "Listen Port (UDP)" "$suggested_port" ctrl_addr
 [[ -n "$ctrl_addr" && "$ctrl_addr" != *:* ]] && ctrl_addr=":${ctrl_addr}"
 else
 while true; do
-prompt_with_default "IRAN Server Address [IP:Port]" "${default_ctrl_addr:-$(get_last_used "client_remote_addr" "")}" ctrl_addr
+prompt_with_default "KHAREJ Server Address [IP:Port]" "${default_ctrl_addr:-$(get_last_used "client_remote_addr" "")}" ctrl_addr
 [[ -n "$ctrl_addr" && "$ctrl_addr" == *:* ]] && break
 colorize red "Invalid format. Use IP:Port."
 done
@@ -333,6 +356,11 @@ fi
 local generated_password
 generated_password=$(head -c16 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c20)
 prompt_with_default "Auth Password (must match on both sides)" "${default_password:-$generated_password}" password
+if ! validate_safe_secret "$password"; then
+colorize red "Password must be 8-128 characters and may not contain quotes, backslashes or spaces."
+press_key
+return 1
+fi
 
 echo ""
 colorize magenta "Obfuscation (Salamander) hides the QUIC handshake pattern from DPI. Recommended if the link is filtered." normal
@@ -351,6 +379,13 @@ fi
 if [[ "$mode" == "client" ]]; then
 echo ""
 prompt_with_default "TLS SNI (domain shown in the handshake, for camouflage)" "${default_sni:-www.digikala.com}" sni
+while true; do
+prompt_with_default "KHAREJ certificate SHA256 fingerprint" "$default_pin" cert_pin
+local compact_pin="${cert_pin//:/}"
+compact_pin="${compact_pin// /}"
+[[ "$compact_pin" =~ ^[0-9a-fA-F]{64}$ ]] && break
+colorize red "A valid 64-hex SHA256 fingerprint is required. Show it on KHAREJ with: openssl x509 -in ${CERT_FILE} -noout -fingerprint -sha256"
+done
 echo ""
 colorize green "Supported formats:"
 echo "  1. 443           - forward port 443"
@@ -379,7 +414,17 @@ fi
 
 local ctrl_port prefix config_name config_path
 ctrl_port="${ctrl_addr##*:}"
-[[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
+if ! validate_port_number "$ctrl_port"; then
+colorize red "Invalid Hysteria2 control port: ${ctrl_port}"
+press_key
+return 1
+fi
+if [[ "$mode" == "client" ]] && ! validate_port_mapping_csv "$ports_csv" false; then
+colorize red "Invalid port mapping. Use forms such as 443 or 443=5000."
+press_key
+return 1
+fi
+local prefix="$side"
 config_name="${prefix}${ctrl_port}"
 config_path="${HYSTERIA2_DIR}/${config_name}.yaml"
 
@@ -388,16 +433,34 @@ colorize red "A Hysteria2 tunnel already uses port ${ctrl_port} on this side. Ch
 press_key
 return 1
 fi
+TUNNEL_LAST_CONFIG_PATH="$config_path"
 
 if [[ "$mode" == "server" ]]; then
 core_hysteria2_generate_server_config "$config_path" "$ctrl_port" "$password" "$obfs_password"
-else
-core_hysteria2_generate_client_config "$config_path" "$ctrl_addr" "$password" "$obfs_password" "$sni" "$ports_csv"
+tm_firewall_close_owner "hysteria2:${config_name}:control"
+if ! tm_firewall_open_port "hysteria2:${config_name}:control" "$ctrl_port" udp; then
+rm -f "$config_path"
+return 1
 fi
-core_hysteria2_create_service "$prefix" "$ctrl_port" "$config_path" "$mode"
-
+else
+core_hysteria2_generate_client_config "$config_path" "$ctrl_addr" "$password" "$obfs_password" "$sni" "$ports_csv" "$cert_pin"
+if ! tm_firewall_sync_mapping "hysteria2:${config_name}:forward" "$ports_csv" "tcp" false; then
+rm -f "$config_path"
+return 1
+fi
+fi
+if ! core_hysteria2_create_service "$prefix" "$ctrl_port" "$config_path" "$mode"; then
+tm_firewall_close_owner "hysteria2:${config_name}:control"
+tm_firewall_close_owner "hysteria2:${config_name}:forward"
+rm -f "$config_path" "${service_dir}/hysteria2-${config_name}.service"
+systemctl daemon-reload
+colorize red "Hysteria2 service failed to start. Check: journalctl -eu hysteria2-${config_name}.service"
+return 1
+fi
 if [[ -n "$old_config_name" && "${old_config_name}" != "hysteria2-${config_name}" ]]; then
 local old_service="hysteria2-${old_config_name#hysteria2-}.service"
+tm_firewall_close_owner "hysteria2:${old_config_name#hysteria2-}:control"
+tm_firewall_close_owner "hysteria2:${old_config_name#hysteria2-}:forward"
 systemctl disable --now "$old_service" >/dev/null 2>&1
 rm -f "${service_dir}/${old_service}"
 systemctl daemon-reload
@@ -412,6 +475,10 @@ ensure_watchdog_installed
 ensure_journal_limits
 echo ""
 colorize green "✔ Hysteria2 configuration completed successfully!" bold
+if [[ "$mode" == "server" ]]; then
+colorize yellow "Copy this SHA256 fingerprint to the IRAN client:"
+openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null
+fi
 echo ""
 core_hysteria2_diagnostics "$config_path"
 }
@@ -419,13 +486,13 @@ core_hysteria2_diagnostics "$config_path"
 core_hysteria2_configure_tunnel() {
 core_hysteria2_ensure_ready
 clear
-colorize green "1) Configure IRAN (Server)" bold
-colorize magenta "2) Configure KHAREJ (Client)" bold
+colorize green "1) Configure IRAN (Client / public forwarded ports)" bold
+colorize magenta "2) Configure KHAREJ (QUIC server / backend side)" bold
 echo ""
 read -r -p "Enter your choice: " choice
 case "$choice" in
-1) core_hysteria2_configure "server" ;;
-2) core_hysteria2_configure "client" ;;
+1) core_hysteria2_configure "client" "" "iran" ;;
+2) core_hysteria2_configure "server" "" "kharej" ;;
 *) colorize red "Invalid option!"; sleep 1 ;;
 esac
 }
@@ -443,7 +510,7 @@ service_name="hysteria2-$(basename "${config_path%.yaml}").service"
 peer_ip=$(read_tunnel_meta "$config_name" "peer_ip")
 ssh_port=$(read_tunnel_meta "$config_name" "peer_ssh_port")
 [[ -z "$ssh_port" ]] && ssh_port="22"
-if [[ "$role" == "server" ]]; then my_label="IRAN"; peer_label="KHAREJ"; else my_label="KHAREJ"; peer_label="IRAN"; fi
+if [[ "$(basename "$config_path")" == iran* ]]; then my_label="IRAN"; peer_label="KHAREJ"; else my_label="KHAREJ"; peer_label="IRAN"; fi
 
 clear
 colorize cyan "Tunnel Diagnostics: $(basename "${config_path%.yaml}") (Hysteria2)" bold
@@ -501,11 +568,11 @@ local result="fail"
 local -a ports
 IFS=$'\n' read -r -d '' -a ports < <(hysteria2_list_forwards "$config_path" | awk '{print $1}' && printf '\0')
 if [[ "${#ports[@]}" -gt 0 && -n "${ports[0]}" ]]; then
-if tcp_port_open "$peer_ip" "${ports[0]}" 3; then
-colorize green "✔ Forwarded port ${ports[0]} is reachable on ${peer_ip}"
+if tcp_port_open "127.0.0.1" "${ports[0]}" 3; then
+colorize green "✔ Local public listener ${ports[0]} is reachable on this IRAN server"
 result="ok"
 else
-colorize red "✘ Services are up but forwarded port ${ports[0]} isn't answering on ${peer_ip} yet."
+colorize red "✘ Services are up but local listener ${ports[0]} isn't answering yet."
 colorize yellow "Check that both sides use the same auth password (and obfs password, if enabled)."
 fi
 else
@@ -577,10 +644,11 @@ press_key
 }
 
 core_hysteria2_edit() {
-local config_path="$1" mode
+local config_path="$1" mode side
 local role
 role=$(core_hysteria2_role "$config_path")
 [[ "$role" == "server" ]] && mode="server" || mode="client"
+[[ "$(basename "$config_path")" == iran* ]] && side="iran" || side="kharej"
 local config_name service_name service_path
 config_name=$(basename "${config_path%.yaml}")
 service_name="hysteria2-${config_name}.service"
@@ -588,22 +656,28 @@ service_path="${service_dir}/${service_name}"
 local backup_dir
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "hysteria2-${config_name}")
 colorize green "Current config backed up: $backup_dir"
-core_hysteria2_configure "$mode" "$config_path"
-local new_service_name
-new_service_name="hysteria2-$(basename "${config_path%.yaml}").service"
-if [[ ! -f "$config_path" ]]; then
-new_service_name="$service_name"
-fi
+local configure_ok="true"
+core_hysteria2_configure "$mode" "$config_path" "$side" || configure_ok="false"
+local new_config_path="${TUNNEL_LAST_CONFIG_PATH:-$config_path}" new_service_name new_config_name
+new_config_name=$(basename "${new_config_path%.yaml}")
+new_service_name="hysteria2-${new_config_name}.service"
 sleep 2
-if systemctl is-active --quiet "$new_service_name" 2>/dev/null; then
+if [[ "$configure_ok" == "true" ]] && systemctl is-active --quiet "$new_service_name" 2>/dev/null; then
 colorize green "✔ Hysteria2 tunnel is healthy after edit."
 rm -rf "$backup_dir"
 else
 colorize red "✘ Service failed to come back up! Rolling back..."
 systemctl disable --now "$new_service_name" >/dev/null 2>&1
-rm -f "${service_dir}/${new_service_name}" "$config_path"
+rm -f "${service_dir}/${new_service_name}" "$new_config_path" "$(tunnel_meta_file "hysteria2-${new_config_name}")"
 systemctl daemon-reload
 restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
+tm_firewall_close_owner "hysteria2:${new_config_name}:control"
+tm_firewall_close_owner "hysteria2:${new_config_name}:forward"
+if [[ "$role" == "server" ]]; then
+tm_firewall_open_port "hysteria2:${config_name}:control" "$(hysteria2_get_listen_port "$config_path")" udp
+else
+tm_firewall_sync_mapping "hysteria2:${config_name}:forward" "$(hysteria2_forwards_csv "$config_path")" tcp false
+fi
 if systemctl is-active --quiet "$service_name"; then
 colorize green "✔ Rollback succeeded, tunnel restored to its previous state."
 else
@@ -624,6 +698,8 @@ local config_name service_name service_path
 config_name=$(basename "${config_path%.yaml}")
 service_name="hysteria2-${config_name}.service"
 service_path="${service_dir}/${service_name}"
+tm_firewall_close_owner "hysteria2:${config_name}:control"
+tm_firewall_close_owner "hysteria2:${config_name}:forward"
 [[ -f "$config_path" ]] && rm -f "$config_path"
 if [[ -f "$service_path" ]]; then
 systemctl is-active --quiet "$service_name" && systemctl disable --now "$service_name" >/dev/null 2>&1
@@ -654,10 +730,7 @@ for config_path in "${HYSTERIA2_DIR}"/{iran,kharej}*.yaml; do
 [[ -f "$config_path" ]] || continue
 config_name=$(basename "${config_path%.yaml}")
 service_name="hysteria2-${config_name}.service"
-if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
-logger -t hysteria2-watchdog "${service_name} is inactive, restarting" 2>/dev/null
-systemctl restart "$service_name" 2>/dev/null
-fi
+watchdog_restart_if_enabled "$service_name" "hysteria2-watchdog"
 done
 }
 
@@ -682,7 +755,11 @@ fi
 IFS='|' read -r last_test last_time <<< "$(read_tunnel_last_test "hysteria2-${config_name}")"
 echo "Last test: ${last_test} (${last_time})"
 echo "Tunnel type: hysteria2 / quic"
-echo "Role: $([[ "$role" == "server" ]] && echo "IRAN (Server)" || echo "KHAREJ (Client)")"
+if [[ "$config_name" == iran* ]]; then
+echo "Side / role: IRAN (Client / public listener)"
+else
+echo "Side / role: KHAREJ (Server / backend side)"
+fi
 echo "Port (UDP): ${port}"
 echo "Obfuscation: $(hysteria2_obfs_enabled "$config_path")"
 if [[ -n "$peer_ip" ]]; then echo "Peer IP: ${peer_ip}"; else echo "Peer IP: not set"; fi

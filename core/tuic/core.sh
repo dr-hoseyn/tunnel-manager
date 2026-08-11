@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2154 # config_dir/service_dir are provided by tunnel-manager.sh.
 # TUIC tunnel core. Mirrors Hysteria2's workflow (both are QUIC/UDP proxy
 # protocols with client-side local-forward config) but ships two separate
 # binaries like FRP (tuic-server / tuic-client) and uses UUID+password auth
@@ -11,11 +12,8 @@
 # github.com/Itsusinn/tuic instead — the actively maintained implementation
 # tuic-protocol/tuic's own README lists as a reference implementation, and
 # the only one publishing current server+client binaries together in one
-# release. That repo does not currently publish checksums, so installs are
-# unverified beyond TLS today — but tuic_try_verify_checksum() probes several
-# common checksum-file naming conventions on every install/update, so this
-# turns itself on automatically the moment upstream adds one, no code change
-# needed.
+# release. Release assets are verified using either an upstream checksum file
+# or GitHub's release-asset SHA-256 digest; verification is fail-closed.
 #
 # Requires lib/common.sh and core/backhaul/core.sh to already be sourced
 # (shared write_tunnel_meta/read_tunnel_meta/write_tunnel_last_test/
@@ -23,7 +21,7 @@
 # Rathole/Hysteria2/FRP already rely on).
 #
 # Layout: ${config_dir}/tuic/{tuic_server_bin,tuic_client_bin}, .../iranN.toml
-# (server), .../kharejN.toml (client). Services: tuic-iranN.service /
+# (client), .../kharejN.toml (server). Services: tuic-iranN.service /
 # tuic-kharejN.service. Config identity prefixed "tuic-".
 #
 # Generated TOML uses bracketed [section] tables (verified against the real
@@ -32,17 +30,9 @@
 # Hysteria2's tcpForwarding and FRP's [[proxies]], so it gets its own
 # awk-based getter below, same approach as those two.
 #
-# Port-forwarding direction matches Hysteria2, not FRP: [[local.tcp_forward]]
-# lives in the CLIENT (KHAREJ) config, "listen" is where the client itself
-# listens, "remote" is an address reachable from the SERVER (IRAN) side. So
-# the "Ports to forward" prompt lives on the KHAREJ side here, same as
-# Hysteria2, not IRAN like Backhaul/Rathole/FRP.
-#
-# The client always sets `skip_cert_verify = true` for the same reason
-# Hysteria2 sets `insecure: true`: Iran and Kharej are separate servers with
-# separate panel installs, so there's no in-panel channel to move a cert
-# fingerprint from one to the other automatically. The real trust boundary
-# is the UUID+password pair, not certificate identity.
+# Port-forwarding lives in the client config; for reverse tunneling the client
+# therefore runs on IRAN and exposes the public listener there. Certificate
+# verification is mandatory: the KHAREJ certificate must be copied to IRAN.
 
 TUIC_REPO="Itsusinn/tuic"
 TUIC_DIR="${config_dir}/tuic"
@@ -59,10 +49,8 @@ core_tuic_install() {
 core_tuic_download_binaries
 }
 
-# Itsusinn/tuic publishes no checksums today, but tries several common
-# per-asset/combined naming conventions each install/update so verification
-# turns on by itself the moment upstream adds any of them — no code change
-# needed later. Echoes "verified" (hash matched), "mismatch" (hash present
+# Tries upstream checksum-file conventions first and then GitHub's release
+# asset digest. Echoes "verified" (hash matched), "mismatch" (hash present
 # but wrong — caller should abort), or "unavailable" (no checksum file found
 # under any of the tried names).
 tuic_try_verify_checksum() {
@@ -75,7 +63,7 @@ content=$(curl -fsSL "$url" 2>/dev/null)
 expected=$(grep -F "$asset_name" <<< "$content" | awk '{print $1}' | head -1)
 [[ -z "$expected" ]] && expected=$(awk '{print $1}' <<< "$content" | head -1)
 [[ -z "$expected" ]] && continue
-actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+actual=$(sha256_file "$file")
 if [[ "$actual" == "$expected" ]]; then
 echo "verified"
 else
@@ -83,6 +71,12 @@ echo "mismatch"
 fi
 return 0
 done
+expected=$(github_release_asset_sha256 "$TUIC_REPO" "$tag" "$asset_name" 2>/dev/null)
+if [[ -n "$expected" ]]; then
+actual=$(sha256_file "$file")
+[[ "$actual" == "$expected" ]] && echo "verified" || echo "mismatch"
+return 0
+fi
 echo "unavailable"
 }
 tuic_generate_uuid() {
@@ -136,24 +130,20 @@ return 1
 fi
 local server_check client_check
 server_check=$(tuic_try_verify_checksum "${tmp_dir}/tuic-server" "tuic-server-${asset_arch}-linux" "$tag")
-if [[ "$server_check" == "mismatch" ]]; then
-colorize red "Checksum verification failed for tuic-server! Refusing to install."
+if [[ "$server_check" != "verified" ]]; then
+colorize red "Could not verify tuic-server! Refusing to install."
 rm -rf "$tmp_dir"
 press_key
 return 1
 fi
 client_check=$(tuic_try_verify_checksum "${tmp_dir}/tuic-client" "tuic-client-${asset_arch}-linux" "$tag")
-if [[ "$client_check" == "mismatch" ]]; then
-colorize red "Checksum verification failed for tuic-client! Refusing to install."
+if [[ "$client_check" != "verified" ]]; then
+colorize red "Could not verify tuic-client! Refusing to install."
 rm -rf "$tmp_dir"
 press_key
 return 1
 fi
-if [[ "$server_check" == "verified" && "$client_check" == "verified" ]]; then
 colorize green "✔ Checksums verified."
-else
-colorize yellow "Note: upstream does not currently publish checksums for this release; installing unverified over HTTPS."
-fi
 chmod +x "${tmp_dir}/tuic-server" "${tmp_dir}/tuic-client"
 if ! "${tmp_dir}/tuic-server" --help &> /dev/null || ! "${tmp_dir}/tuic-client" --help &> /dev/null; then
 colorize red "Downloaded TUIC binaries failed a basic sanity check (--help)."
@@ -241,6 +231,9 @@ grep '^server = ' "$1" 2>/dev/null | head -1 | sed -E 's/^server = "([^"]*)".*/\
 tuic_get_relay_sni() {
 grep '^sni = ' "$1" 2>/dev/null | head -1 | sed -E 's/^sni = "([^"]*)".*/\1/'
 }
+tuic_get_relay_certificate() {
+grep '^certificates = ' "$1" 2>/dev/null | head -1 | sed -E 's/^certificates = \["([^"]*)"\].*/\1/'
+}
 tuic_list_forwards() {
 awk '
 /^\[\[local\.tcp_forward\]\]/ { in_fwd=1; next }
@@ -279,9 +272,7 @@ echo "${addr##*:}"
 fi
 }
 core_tuic_suggest_free_port() {
-local mode="$1" prefix port=443
-[[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
-[[ "$mode" == "server" ]] && port=44300
+local prefix="$1" port=44300
 while [[ -f "${TUIC_DIR}/${prefix}${port}.toml" ]] || is_port_listening_system_wide "$port"; do
 ((port++))
 done
@@ -296,7 +287,7 @@ echo "log_level = \"info\""
 echo "server = \"[::]:${port}\""
 echo ""
 echo "[users]"
-echo "${uuid} = \"${password}\""
+echo "${uuid} = $(toml_quote "$password")"
 echo ""
 echo "[tls]"
 echo "self_sign = false"
@@ -307,15 +298,16 @@ echo "alpn = [\"h3\"]"
 }
 
 core_tuic_generate_client_config() {
-local output_file="$1" server_addr="$2" uuid="$3" password="$4" sni="$5" ports_csv="$6"
+local output_file="$1" server_addr="$2" uuid="$3" password="$4" sni="$5" ports_csv="$6" certificate="$7"
 {
 echo "[relay]"
-echo "server = \"${server_addr}\""
-echo "uuid = \"${uuid}\""
-echo "password = \"${password}\""
+echo "server = $(toml_quote "$server_addr")"
+echo "uuid = $(toml_quote "$uuid")"
+echo "password = $(toml_quote "$password")"
 echo "congestion_control = \"bbr\""
-[[ -n "$sni" ]] && echo "sni = \"${sni}\""
-echo "skip_cert_verify = true"
+[[ -n "$sni" ]] && echo "sni = $(toml_quote "$sni")"
+echo "certificates = [$(toml_quote "$certificate")]"
+echo "skip_cert_verify = false"
 echo "alpn = [\"h3\"]"
 local -a entries=()
 IFS=',' read -r -a entries <<< "$ports_csv"
@@ -337,7 +329,8 @@ local type="$1" port="$2" config_file="$3" mode="$4"
 local bin sub_desc
 if [[ "$mode" == "server" ]]; then bin="$TUIC_SERVER_BIN"; sub_desc="tuic-server"; else bin="$TUIC_CLIENT_BIN"; sub_desc="tuic-client"; fi
 local service_file="${service_dir}/tuic-${type}${port}.service"
-local desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
+local desc_type
+desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
 cat > "$service_file" <<EOF
 [Unit]
 Description=TUIC (${sub_desc}) $desc_type Port $port
@@ -357,14 +350,19 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now "tuic-${type}${port}.service" >/dev/null 2>&1
+enable_service_checked "tuic-${type}${port}.service"
 }
 
 core_tuic_configure() {
 local mode="$1"
 local existing_config="$2"
-local default_ctrl_addr="" default_uuid="" default_password="" default_sni="" default_ports="" default_peer_ip="" default_peer_ssh_port="22"
+TUNNEL_LAST_CONFIG_PATH=""
+local side="${3:-}"
+if [[ -z "$side" && -n "$existing_config" ]]; then
+[[ "$(basename "$existing_config")" == iran* ]] && side="iran" || side="kharej"
+fi
+[[ -z "$side" ]] && { [[ "$mode" == "client" ]] && side="iran" || side="kharej"; }
+local default_ctrl_addr="" default_uuid="" default_password="" default_sni="" default_certificate="" default_ports="" default_peer_ip="" default_peer_ssh_port="22"
 local old_config_name=""
 if [[ -n "$existing_config" && -f "$existing_config" ]]; then
 if [[ "$mode" == "server" ]]; then
@@ -375,6 +373,7 @@ default_ctrl_addr=$(tuic_get_relay_server_addr "$existing_config")
 default_uuid=$(grep '^uuid = ' "$existing_config" 2>/dev/null | head -1 | sed -E 's/^uuid = "([^"]*)".*/\1/')
 default_password=$(grep '^password = ' "$existing_config" 2>/dev/null | head -1 | sed -E 's/^password = "([^"]*)".*/\1/')
 default_sni=$(tuic_get_relay_sni "$existing_config")
+default_certificate=$(tuic_get_relay_certificate "$existing_config")
 default_ports=$(tuic_forwards_csv "$existing_config")
 fi
 old_config_name=$(core_tuic_config_name "$existing_config")
@@ -384,21 +383,21 @@ default_peer_ssh_port=$(read_tunnel_meta "$old_config_name" "peer_ssh_port")
 fi
 
 clear
-colorize cyan "Configuring TUIC $([[ "$mode" == "server" ]] && echo "IRAN (Server)" || echo "KHAREJ (Client)")" bold
+colorize cyan "Configuring TUIC $([[ "$side" == "iran" ]] && echo "IRAN (Client / public listener)" || echo "KHAREJ (Server / backend side)")" bold
 echo ""
 colorize magenta "TUIC tunnels over QUIC (UDP), like Hysteria2 — a lightweight alternative worth trying if one link works better with it than the other." normal
 echo ""
 
-local ctrl_addr uuid password sni ports_csv peer_ip peer_ssh_port
+local ctrl_addr uuid password sni certificate ports_csv peer_ip peer_ssh_port
 
 if [[ "$mode" == "server" ]]; then
 local suggested_port="${default_ctrl_addr#:}"
-[[ -z "$suggested_port" ]] && suggested_port=$(core_tuic_suggest_free_port "server")
+[[ -z "$suggested_port" ]] && suggested_port=$(core_tuic_suggest_free_port "$side")
 prompt_with_default "Listen Port (UDP)" "$suggested_port" ctrl_addr
 [[ -n "$ctrl_addr" && "$ctrl_addr" != *:* ]] && ctrl_addr=":${ctrl_addr}"
 else
 while true; do
-prompt_with_default "IRAN Server Address [IP:Port]" "${default_ctrl_addr:-$(get_last_used "client_remote_addr" "")}" ctrl_addr
+prompt_with_default "KHAREJ Server Address [IP:Port]" "${default_ctrl_addr:-$(get_last_used "client_remote_addr" "")}" ctrl_addr
 [[ -n "$ctrl_addr" && "$ctrl_addr" == *:* ]] && break
 colorize red "Invalid format. Use IP:Port."
 done
@@ -409,10 +408,20 @@ generated_uuid=$(tuic_generate_uuid)
 generated_password=$(head -c16 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c20)
 prompt_with_default "User UUID (must match on both sides)" "${default_uuid:-$generated_uuid}" uuid
 prompt_with_default "Password (must match on both sides)" "${default_password:-$generated_password}" password
+if [[ ! "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || ! validate_safe_secret "$password"; then
+colorize red "Invalid UUID or password. Password must be 8-128 safe characters."
+press_key
+return 1
+fi
 
 if [[ "$mode" == "client" ]]; then
 echo ""
-prompt_with_default "TLS SNI (domain shown in the handshake, for camouflage)" "${default_sni:-www.digikala.com}" sni
+prompt_with_default "TLS SNI (must match the KHAREJ certificate)" "${default_sni:-backhaul.com}" sni
+while true; do
+prompt_with_default "Trusted KHAREJ certificate path on this IRAN server" "$default_certificate" certificate
+[[ -f "$certificate" ]] && break
+colorize red "Certificate not found. Secure-copy ${CERT_FILE} from KHAREJ to a separate file on this server first."
+done
 echo ""
 colorize green "Supported formats:"
 echo "  1. 443           - forward port 443"
@@ -441,7 +450,17 @@ fi
 
 local ctrl_port prefix config_name config_path
 ctrl_port="${ctrl_addr##*:}"
-[[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
+if ! validate_port_number "$ctrl_port"; then
+colorize red "Invalid TUIC control port: ${ctrl_port}"
+press_key
+return 1
+fi
+if [[ "$mode" == "client" ]] && ! validate_port_mapping_csv "$ports_csv" false; then
+colorize red "Invalid port mapping. Use forms such as 443 or 443=5000."
+press_key
+return 1
+fi
+local prefix="$side"
 config_name="${prefix}${ctrl_port}"
 config_path="${TUIC_DIR}/${config_name}.toml"
 
@@ -450,16 +469,34 @@ colorize red "A TUIC tunnel already uses port ${ctrl_port} on this side. Choose 
 press_key
 return 1
 fi
+TUNNEL_LAST_CONFIG_PATH="$config_path"
 
 if [[ "$mode" == "server" ]]; then
 core_tuic_generate_server_config "$config_path" "$ctrl_port" "$uuid" "$password"
-else
-core_tuic_generate_client_config "$config_path" "$ctrl_addr" "$uuid" "$password" "$sni" "$ports_csv"
+tm_firewall_close_owner "tuic:${config_name}:control"
+if ! tm_firewall_open_port "tuic:${config_name}:control" "$ctrl_port" udp; then
+rm -f "$config_path"
+return 1
 fi
-core_tuic_create_service "$prefix" "$ctrl_port" "$config_path" "$mode"
-
+else
+core_tuic_generate_client_config "$config_path" "$ctrl_addr" "$uuid" "$password" "$sni" "$ports_csv" "$certificate"
+if ! tm_firewall_sync_mapping "tuic:${config_name}:forward" "$ports_csv" "tcp" false; then
+rm -f "$config_path"
+return 1
+fi
+fi
+if ! core_tuic_create_service "$prefix" "$ctrl_port" "$config_path" "$mode"; then
+tm_firewall_close_owner "tuic:${config_name}:control"
+tm_firewall_close_owner "tuic:${config_name}:forward"
+rm -f "$config_path" "${service_dir}/tuic-${config_name}.service"
+systemctl daemon-reload
+colorize red "TUIC service failed to start. Check: journalctl -eu tuic-${config_name}.service"
+return 1
+fi
 if [[ -n "$old_config_name" && "${old_config_name}" != "tuic-${config_name}" ]]; then
 local old_service="tuic-${old_config_name#tuic-}.service"
+tm_firewall_close_owner "tuic:${old_config_name#tuic-}:control"
+tm_firewall_close_owner "tuic:${old_config_name#tuic-}:forward"
 systemctl disable --now "$old_service" >/dev/null 2>&1
 rm -f "${service_dir}/${old_service}"
 systemctl daemon-reload
@@ -474,6 +511,10 @@ ensure_watchdog_installed
 ensure_journal_limits
 echo ""
 colorize green "✔ TUIC configuration completed successfully!" bold
+if [[ "$mode" == "server" ]]; then
+colorize yellow "Secure-copy this certificate to a separate file on the IRAN client: $CERT_FILE"
+openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 2>/dev/null
+fi
 echo ""
 core_tuic_diagnostics "$config_path"
 }
@@ -481,13 +522,13 @@ core_tuic_diagnostics "$config_path"
 core_tuic_configure_tunnel() {
 core_tuic_ensure_ready
 clear
-colorize green "1) Configure IRAN (Server)" bold
-colorize magenta "2) Configure KHAREJ (Client)" bold
+colorize green "1) Configure IRAN (Client / public forwarded ports)" bold
+colorize magenta "2) Configure KHAREJ (QUIC server / backend side)" bold
 echo ""
 read -r -p "Enter your choice: " choice
 case "$choice" in
-1) core_tuic_configure "server" ;;
-2) core_tuic_configure "client" ;;
+1) core_tuic_configure "client" "" "iran" ;;
+2) core_tuic_configure "server" "" "kharej" ;;
 *) colorize red "Invalid option!"; sleep 1 ;;
 esac
 }
@@ -505,7 +546,7 @@ service_name="tuic-$(basename "${config_path%.toml}").service"
 peer_ip=$(read_tunnel_meta "$config_name" "peer_ip")
 ssh_port=$(read_tunnel_meta "$config_name" "peer_ssh_port")
 [[ -z "$ssh_port" ]] && ssh_port="22"
-if [[ "$role" == "server" ]]; then my_label="IRAN"; peer_label="KHAREJ"; else my_label="KHAREJ"; peer_label="IRAN"; fi
+if [[ "$(basename "$config_path")" == iran* ]]; then my_label="IRAN"; peer_label="KHAREJ"; else my_label="KHAREJ"; peer_label="IRAN"; fi
 
 clear
 colorize cyan "Tunnel Diagnostics: $(basename "${config_path%.toml}") (TUIC)" bold
@@ -563,11 +604,11 @@ local result="fail"
 local -a ports
 IFS=$'\n' read -r -d '' -a ports < <(tuic_list_forwards "$config_path" | awk '{print $1}' && printf '\0')
 if [[ "${#ports[@]}" -gt 0 && -n "${ports[0]}" ]]; then
-if tcp_port_open "$peer_ip" "${ports[0]}" 3; then
-colorize green "✔ Forwarded port ${ports[0]} is reachable on ${peer_ip}"
+if tcp_port_open "127.0.0.1" "${ports[0]}" 3; then
+colorize green "✔ Local public listener ${ports[0]} is reachable on this IRAN server"
 result="ok"
 else
-colorize red "✘ Services are up but forwarded port ${ports[0]} isn't answering on ${peer_ip} yet."
+colorize red "✘ Services are up but local listener ${ports[0]} isn't answering yet."
 colorize yellow "Check that both sides use the same UUID and password."
 fi
 else
@@ -639,10 +680,11 @@ press_key
 }
 
 core_tuic_edit() {
-local config_path="$1" mode
+local config_path="$1" mode side
 local role
 role=$(core_tuic_role "$config_path")
 [[ "$role" == "server" ]] && mode="server" || mode="client"
+[[ "$(basename "$config_path")" == iran* ]] && side="iran" || side="kharej"
 local config_name service_name service_path
 config_name=$(basename "${config_path%.toml}")
 service_name="tuic-${config_name}.service"
@@ -650,22 +692,28 @@ service_path="${service_dir}/${service_name}"
 local backup_dir
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "tuic-${config_name}")
 colorize green "Current config backed up: $backup_dir"
-core_tuic_configure "$mode" "$config_path"
-local new_service_name
-new_service_name="tuic-$(basename "${config_path%.toml}").service"
-if [[ ! -f "$config_path" ]]; then
-new_service_name="$service_name"
-fi
+local configure_ok="true"
+core_tuic_configure "$mode" "$config_path" "$side" || configure_ok="false"
+local new_config_path="${TUNNEL_LAST_CONFIG_PATH:-$config_path}" new_service_name new_config_name
+new_config_name=$(basename "${new_config_path%.toml}")
+new_service_name="tuic-${new_config_name}.service"
 sleep 2
-if systemctl is-active --quiet "$new_service_name" 2>/dev/null; then
+if [[ "$configure_ok" == "true" ]] && systemctl is-active --quiet "$new_service_name" 2>/dev/null; then
 colorize green "✔ TUIC tunnel is healthy after edit."
 rm -rf "$backup_dir"
 else
 colorize red "✘ Service failed to come back up! Rolling back..."
 systemctl disable --now "$new_service_name" >/dev/null 2>&1
-rm -f "${service_dir}/${new_service_name}" "$config_path"
+rm -f "${service_dir}/${new_service_name}" "$new_config_path" "$(tunnel_meta_file "tuic-${new_config_name}")"
 systemctl daemon-reload
 restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
+tm_firewall_close_owner "tuic:${new_config_name}:control"
+tm_firewall_close_owner "tuic:${new_config_name}:forward"
+if [[ "$role" == "server" ]]; then
+tm_firewall_open_port "tuic:${config_name}:control" "$(tuic_get_listen_addr "$config_path")" udp
+else
+tm_firewall_sync_mapping "tuic:${config_name}:forward" "$(tuic_forwards_csv "$config_path")" tcp false
+fi
 if systemctl is-active --quiet "$service_name"; then
 colorize green "✔ Rollback succeeded, tunnel restored to its previous state."
 else
@@ -686,6 +734,8 @@ local config_name service_name service_path
 config_name=$(basename "${config_path%.toml}")
 service_name="tuic-${config_name}.service"
 service_path="${service_dir}/${service_name}"
+tm_firewall_close_owner "tuic:${config_name}:control"
+tm_firewall_close_owner "tuic:${config_name}:forward"
 [[ -f "$config_path" ]] && rm -f "$config_path"
 if [[ -f "$service_path" ]]; then
 systemctl is-active --quiet "$service_name" && systemctl disable --now "$service_name" >/dev/null 2>&1
@@ -716,10 +766,7 @@ for config_path in "${TUIC_DIR}"/{iran,kharej}*.toml; do
 [[ -f "$config_path" ]] || continue
 config_name=$(basename "${config_path%.toml}")
 service_name="tuic-${config_name}.service"
-if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
-logger -t tuic-watchdog "${service_name} is inactive, restarting" 2>/dev/null
-systemctl restart "$service_name" 2>/dev/null
-fi
+watchdog_restart_if_enabled "$service_name" "tuic-watchdog"
 done
 }
 
@@ -744,7 +791,11 @@ fi
 IFS='|' read -r last_test last_time <<< "$(read_tunnel_last_test "tuic-${config_name}")"
 echo "Last test: ${last_test} (${last_time})"
 echo "Tunnel type: tuic / quic"
-echo "Role: $([[ "$role" == "server" ]] && echo "IRAN (Server)" || echo "KHAREJ (Client)")"
+if [[ "$config_name" == iran* ]]; then
+echo "Side / role: IRAN (Client / public listener)"
+else
+echo "Side / role: KHAREJ (Server / backend side)"
+fi
 echo "Port (UDP): ${port}"
 if [[ -n "$peer_ip" ]]; then echo "Peer IP: ${peer_ip}"; else echo "Peer IP: not set"; fi
 if [[ "$role" == "client" ]]; then

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2154 # config_dir/service_dir are provided by tunnel-manager.sh.
 # Backhaul tunnel core. Behavior is unchanged from the original single-file
 # backhaul.sh; this is the same code, just living in its own module so other
 # cores (rathole, and later gost/frp/...) can sit alongside it without
@@ -172,30 +173,9 @@ fi
 colorize green "Kernel prerequisites applied."
 }
 allow_forwarded_ports_firewall() {
-local mapping="$1" accept_udp="$2" entry listen proto
-local -a protos=(tcp)
-[[ "$accept_udp" == "true" ]] && protos+=(udp)
-local -a entries=()
-IFS=',' read -r -a entries <<< "$mapping"
-local changed="false"
-for entry in "${entries[@]}"; do
-entry="${entry// /}"
-[[ -z "$entry" ]] && continue
-listen="${entry%%[=:]*}"
-listen="${listen//-/:}"
-[[ -z "$listen" ]] && continue
-for proto in "${protos[@]}"; do
-if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-ufw allow "${listen}/${proto}" >/dev/null 2>&1
-elif command -v iptables &> /dev/null; then
-if ! iptables -C INPUT -p "$proto" --dport "$listen" -j ACCEPT 2>/dev/null; then
-iptables -I INPUT -p "$proto" --dport "$listen" -j ACCEPT
-changed="true"
-fi
-fi
-done
-done
-[[ "$changed" == "true" ]] && command -v iptables &> /dev/null && persist_iptables_rules
+local owner="$1" mapping="$2" accept_udp="$3" protocols="tcp"
+[[ "$accept_udp" == "true" ]] && protocols="tcp udp"
+tm_firewall_sync_mapping "$owner" "$mapping" "$protocols" true
 }
 parse_port_entry() {
 local entry="$1" listen dest
@@ -393,6 +373,7 @@ apply_tun_port_forwarding() {
 local mapping="$1" forwarder="$2" tun_remote_addr="$3" tun_name="$4" config_name="$5"
 [[ -z "$mapping" ]] && return
 local target="${tun_remote_addr%/*}"
+allow_forwarded_ports_firewall "backhaul:${config_name}" "$mapping" "true" || return 1
 case "$forwarder" in
 iptables)
 ensure_tun_masquerade "$tun_name"
@@ -406,7 +387,7 @@ ensure_tun_masquerade "$tun_name"
 apply_ipvs_forwarding "$mapping" "$target"
 ;;
 *)
-allow_forwarded_ports_firewall "$mapping" "true"
+:
 ;;
 esac
 }
@@ -453,9 +434,11 @@ for config_path in "${config_dir}"/{iran,kharej}*.toml; do
 [[ -f "$config_path" ]] || continue
 config_name=$(basename "${config_path%.toml}")
 service_name="backhaul-${config_name}.service"
+if ! service_should_run "$service_name"; then
+continue
+fi
 if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
-logger -t backhaul-watchdog "${service_name} is inactive, restarting" 2>/dev/null
-systemctl restart "$service_name" 2>/dev/null
+watchdog_restart_if_enabled "$service_name" "backhaul-watchdog"
 continue
 fi
 is_tun="false"; tunnel_is_tun "$config_path" && is_tun="true"
@@ -498,11 +481,12 @@ tunnel_meta_file() {
 echo "${config_dir}/.meta/$1.meta"
 }
 write_tunnel_meta() {
-local config_name="$1" peer_ip="$2" peer_ssh_port="$3"
+local config_name="$1" peer_ip="$2" peer_ssh_port="$3" forward_ports="${4:-}"
 mkdir -p "${config_dir}/.meta"
 {
 echo "peer_ip=${peer_ip}"
 echo "peer_ssh_port=${peer_ssh_port:-22}"
+[[ -n "$forward_ports" ]] && echo "forward_ports=${forward_ports}"
 } > "$(tunnel_meta_file "$config_name")"
 }
 read_tunnel_meta() {
@@ -677,7 +661,7 @@ install_jq() {
 if ! command -v jq &> /dev/null; then
 if command -v apt-get &> /dev/null; then
 colorize yellow "Installing jq..."
-sudo apt-get update && sudo apt-get install -y jq
+apt-get update && apt-get install -y jq
 else
 colorize red "Error: Unsupported package manager. Please install jq manually."
 press_key
@@ -686,71 +670,55 @@ fi
 fi
 }
 download_and_extract_backhaul() {
-local is_menu="false" backup_bin=""
-if [[ "$1" == "menu" ]]; then
+local is_menu="false"
+if [[ "${1:-}" == "menu" ]]; then
 is_menu="true"
-if [[ -f "${config_dir}/backhaul_premium" ]]; then
-backup_bin="${config_dir}/.backhaul_premium.prev"
-cp -p "${config_dir}/backhaul_premium" "$backup_bin"
-fi
-rm -f "${config_dir}/backhaul_premium" >/dev/null 2>&1
-colorize cyan "Restart all services after updating to new core" bold
-sleep 2
 else
 [[ -f "${config_dir}/backhaul_premium" ]] && return 1
 fi
-ARCH=$(uname -m)
-case "$ARCH" in
-x86_64)
-PRIMARY_URL="http://en.backhaul-dev.com:2095/backhaul_premium_amd64.tar.gz"
-FALLBACK_URL="http://ir.backhaul-dev.com:2095/backhaul_premium_amd64.tar.gz"
-;;
-arm64|aarch64)
-PRIMARY_URL="http://en.backhaul-dev.com:2095/backhaul_premium_arm64.tar.gz"
-FALLBACK_URL="http://ir.backhaul-dev.com:2095/backhaul_premium_arm64.tar.gz"
-;;
-*)
-colorize red "Unsupported architecture: $ARCH."
-[[ -n "$backup_bin" ]] && mv -f "$backup_bin" "${config_dir}/backhaul_premium"
-[[ "$is_menu" == "true" ]] && return 1
-exit 1
-;;
-esac
-DOWNLOAD_DIR=$(mktemp -d)
-echo "Downloading Backhaul..."
-local download_ok="true"
-if ! curl -sSL --max-time 10 -o "$DOWNLOAD_DIR/backhaul.tar.gz" "$PRIMARY_URL"; then
-colorize yellow "Primary download failed. Trying fallback..."
-if ! curl -sSL --max-time 30 -o "$DOWNLOAD_DIR/backhaul.tar.gz" "$FALLBACK_URL"; then
-colorize red "Download failed."
-download_ok="false"
-fi
-fi
-if [[ "$download_ok" == "false" ]]; then
-rm -rf "$DOWNLOAD_DIR"
-if [[ -n "$backup_bin" ]]; then
-mv -f "$backup_bin" "${config_dir}/backhaul_premium"
-colorize yellow "Restored the previous core."
-fi
+local arch repo_raw expected tmp_bin commit_sha
+arch=$(uname -m)
+if [[ "$arch" != "x86_64" ]]; then
+colorize red "The repository currently publishes a verified Backhaul Premium binary for x86_64 only (detected: ${arch})."
 [[ "$is_menu" == "true" ]] && { press_key; return 1; }
 exit 1
 fi
+if ! commit_sha=$(curl -fsSL "https://api.github.com/repos/dr-hoseyn/tunnel-manager/commits/main" | jq -r '.sha') || [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+colorize red "Could not resolve the repository commit; keeping the current Backhaul binary."
+[[ "$is_menu" == "true" ]] && { press_key; return 1; }
+exit 1
+fi
+repo_raw="https://raw.githubusercontent.com/dr-hoseyn/tunnel-manager/${commit_sha}"
 mkdir -p "$config_dir"
-tar -xzf "$DOWNLOAD_DIR/backhaul.tar.gz" -C "$config_dir"
-chmod u+x "${config_dir}/backhaul_premium"
-rm -rf "$DOWNLOAD_DIR"
-if ! "${config_dir}/backhaul_premium" -v &> /dev/null; then
-colorize red "New core failed a basic sanity check (backhaul_premium -v)."
-if [[ -n "$backup_bin" ]]; then
-mv -f "$backup_bin" "${config_dir}/backhaul_premium"
-colorize yellow "Restored the previous core."
-else
-colorize red "No previous core available to restore!"
-fi
+tmp_bin=$(mktemp "${config_dir}/.backhaul_premium.XXXXXX")
+echo "Downloading verified Backhaul core from the project repository..."
+if ! expected=$(curl -fsSL "${repo_raw}/backhaul_premium.sha256" | awk '{print $1}'); then
+colorize red "Could not download the Backhaul checksum; refusing an unverified update."
+rm -f "$tmp_bin"
 [[ "$is_menu" == "true" ]] && { press_key; return 1; }
 exit 1
 fi
-[[ -n "$backup_bin" ]] && rm -f "$backup_bin"
+if ! curl -fsSL "${repo_raw}/backhaul_premium" -o "$tmp_bin" || ! verify_sha256 "$tmp_bin" "$expected" "Backhaul core"; then
+rm -f "$tmp_bin"
+[[ "$is_menu" == "true" ]] && { press_key; return 1; }
+exit 1
+fi
+chmod 0755 "$tmp_bin"
+if ! "$tmp_bin" -v &> /dev/null; then
+colorize red "Verified core failed its version sanity check; keeping the previous binary."
+rm -f "$tmp_bin"
+[[ "$is_menu" == "true" ]] && { press_key; return 1; }
+exit 1
+fi
+mv -f "$tmp_bin" "${config_dir}/backhaul_premium"
+if [[ "$is_menu" == "true" ]]; then
+colorize cyan "Restarting enabled Backhaul services on the verified core..." bold
+local service
+while IFS= read -r service; do
+[[ "$service" == backhaul-iran*.service || "$service" == backhaul-kharej*.service ]] || continue
+service_should_run "$service" && systemctl restart "$service" 2>/dev/null
+done < <(systemctl list-unit-files 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
+fi
 colorize green "Backhaul installation completed."
 }
 reset_config() {
@@ -787,7 +755,7 @@ echo -ne "[*] IRAN Server Address [IP:Port] or [Domain:Port] (default: $default_
 else
 echo -ne "[*] IRAN Server Address [IP:Port] or [Domain:Port]: "
 fi
-read -r CONFIG[remote_addr]
+read -r 'CONFIG[remote_addr]'
 CONFIG[remote_addr]="${CONFIG[remote_addr]:-$default_remote_addr}"
 if [[ -z "${CONFIG[remote_addr]}" ]]; then
 colorize red "Server address cannot be empty."
@@ -807,7 +775,7 @@ echo -ne "[-] Edge IP/Domain (optional, current: $old_edge_ip, press Enter to ke
 else
 echo -ne "[-] Edge IP/Domain (optional, press Enter to skip): "
 fi
-read -r CONFIG[edge_ip]
+read -r 'CONFIG[edge_ip]'
 CONFIG[edge_ip]="${CONFIG[edge_ip]:-$old_edge_ip}"
 fi
 CONFIG[dial_timeout]="10"
@@ -873,9 +841,9 @@ local default_transport
 default_transport="${CONFIG[transport_type]:-$(get_last_used "transport_type" "tcp")}"
 while true; do
 echo -ne "Select transport (default: $default_transport): "
-read -r CONFIG[transport_type]
+read -r 'CONFIG[transport_type]'
 CONFIG[transport_type]="${CONFIG[transport_type]:-$default_transport}"
-[[ " ${valid_transports[*]} " =~ " ${CONFIG[transport_type]} " ]] && break
+value_in_list "${CONFIG[transport_type]}" "${valid_transports[@]}" && break
 colorize red "Invalid transport."
 done
 if [[ "${CONFIG[transport_type]}" == "tun" ]]; then
@@ -886,9 +854,9 @@ echo "Available encapsulations:"
 printf '  • %s\n' "${encapsulations[@]}"
 while true; do
 echo -ne "Select encapsulation (default: $default_encapsulation): "
-read -r CONFIG[tun_encapsulation]
+read -r 'CONFIG[tun_encapsulation]'
 CONFIG[tun_encapsulation]="${CONFIG[tun_encapsulation]:-$default_encapsulation}"
-[[ " ${encapsulations[*]} " =~ " ${CONFIG[tun_encapsulation]} " ]] && break
+value_in_list "${CONFIG[tun_encapsulation]}" "${encapsulations[@]}" && break
 colorize red "Invalid encapsulation."
 done
 fi
@@ -1088,7 +1056,7 @@ echo -ne "Enter port mappings (comma-separated, current: $old_mapping): "
 else
 echo -ne "Enter port mappings (comma-separated): "
 fi
-read -r CONFIG[ports_mapping]
+read -r 'CONFIG[ports_mapping]'
 CONFIG[ports_mapping]="${CONFIG[ports_mapping]:-$old_mapping}"
 echo ""
 else
@@ -1116,7 +1084,7 @@ echo -ne "Enter port mappings (comma-separated, current: $old_mapping): "
 else
 echo -ne "Enter port mappings (comma-separated): "
 fi
-read -r CONFIG[ports_mapping]
+read -r 'CONFIG[ports_mapping]'
 CONFIG[ports_mapping]="${CONFIG[ports_mapping]:-$old_mapping}"
 echo ""
 fi
@@ -1166,18 +1134,18 @@ local is_ipx="$4"
 {
 if [[ "$mode" == "server" ]] && [[ "$is_ipx" == "false" ]]; then
 echo "[listener]"
-echo "bind_addr = \"${CONFIG[bind_addr]}\""
+echo "bind_addr = $(toml_quote "${CONFIG[bind_addr]}")"
 echo ""
 elif [[ "$is_ipx" == "false" ]]; then
 echo "[dialer]"
-echo "remote_addr = \"${CONFIG[remote_addr]}\""
-[[ -n "${CONFIG[edge_ip]}" ]] && echo "edge_ip = \"${CONFIG[edge_ip]}\""
+echo "remote_addr = $(toml_quote "${CONFIG[remote_addr]}")"
+[[ -n "${CONFIG[edge_ip]}" ]] && echo "edge_ip = $(toml_quote "${CONFIG[edge_ip]}")"
 echo "dial_timeout = ${CONFIG[dial_timeout]}"
 echo "retry_interval = ${CONFIG[retry_interval]}"
 echo ""
 fi
 echo "[transport]"
-echo "type = \"${CONFIG[transport_type]}\""
+echo "type = $(toml_quote "${CONFIG[transport_type]}")"
 [[ -n "${CONFIG[nodelay]}" ]] && echo "nodelay = ${CONFIG[nodelay]}"
 [[ -n "${CONFIG[keepalive_period]}" ]] && echo "keepalive_period = ${CONFIG[keepalive_period]}"
 if [[ "$mode" == "server" ]]; then
@@ -1192,21 +1160,21 @@ fi
 echo ""
 if [[ "$is_tun" == "true" ]]; then
 echo "[tun]"
-echo "encapsulation = \"${CONFIG[tun_encapsulation]}\""
-echo "name = \"${CONFIG[tun_name]}\""
-echo "local_addr = \"${CONFIG[tun_local_addr]}\""
-echo "remote_addr = \"${CONFIG[tun_remote_addr]}\""
+echo "encapsulation = $(toml_quote "${CONFIG[tun_encapsulation]}")"
+echo "name = $(toml_quote "${CONFIG[tun_name]}")"
+echo "local_addr = $(toml_quote "${CONFIG[tun_local_addr]}")"
+echo "remote_addr = $(toml_quote "${CONFIG[tun_remote_addr]}")"
 echo "health_port = ${CONFIG[tun_health_port]}"
 echo "mtu = ${CONFIG[tun_mtu]}"
 echo ""
 fi
 if [[ "$is_ipx" == "true" ]]; then
 echo "[ipx]"
-echo "mode = \"${CONFIG[ipx_mode]}\""
-echo "profile = \"${CONFIG[ipx_profile]}\""
-echo "listen_ip = \"${CONFIG[ipx_listen_ip]}\""
-echo "dst_ip = \"${CONFIG[ipx_dst_ip]}\""
-echo "interface = \"${CONFIG[ipx_interface]}\""
+echo "mode = $(toml_quote "${CONFIG[ipx_mode]}")"
+echo "profile = $(toml_quote "${CONFIG[ipx_profile]}")"
+echo "listen_ip = $(toml_quote "${CONFIG[ipx_listen_ip]}")"
+echo "dst_ip = $(toml_quote "${CONFIG[ipx_dst_ip]}")"
+echo "interface = $(toml_quote "${CONFIG[ipx_interface]}")"
 [[ -n "${CONFIG[ipx_icmp_type]}" ]] && echo "icmp_type = ${CONFIG[ipx_icmp_type]}"
 [[ -n "${CONFIG[ipx_icmp_code]}" ]] && echo "icmp_code = ${CONFIG[ipx_icmp_code]}"
 echo ""
@@ -1224,30 +1192,30 @@ echo "[security]"
 if [[ "$is_ipx" == "true" ]]; then
 echo "enable_encryption = ${CONFIG[enable_encryption]}"
 [[ "${CONFIG[enable_encryption]}" == "true" ]] && {
-echo "algorithm = \"${CONFIG[algorithm]}\""
-echo "psk = \"${CONFIG[psk]}\""
+echo "algorithm = $(toml_quote "${CONFIG[algorithm]}")"
+echo "psk = $(toml_quote "${CONFIG[psk]}")"
 echo "kdf_iterations = ${CONFIG[kdf_iterations]}"
 }
 else
-echo "token = \"${CONFIG[token]}\""
+echo "token = $(toml_quote "${CONFIG[token]}")"
 fi
 echo ""
 if [[ -n "${CONFIG[tls_sni]}" || -n "${CONFIG[tls_cert]}" ]]; then
 echo "[tls]"
-[[ -n "${CONFIG[tls_sni]}" ]]  && echo "sni = \"${CONFIG[tls_sni]}\""
-[[ -n "${CONFIG[tls_cert]}" ]] && echo "tls_cert = \"${CONFIG[tls_cert]}\""
-[[ -n "${CONFIG[tls_key]}" ]]  && echo "tls_key = \"${CONFIG[tls_key]}\""
+[[ -n "${CONFIG[tls_sni]}" ]]  && echo "sni = $(toml_quote "${CONFIG[tls_sni]}")"
+[[ -n "${CONFIG[tls_cert]}" ]] && echo "tls_cert = $(toml_quote "${CONFIG[tls_cert]}")"
+[[ -n "${CONFIG[tls_key]}" ]]  && echo "tls_key = $(toml_quote "${CONFIG[tls_key]}")"
 echo ""
 fi
 echo "[tuning]"
 [[ -n "${CONFIG[auto_tuning]}" ]]     && echo "auto_tuning = ${CONFIG[auto_tuning]}"
-[[ -n "${CONFIG[tuning_profile]}" ]]  && echo "tuning_profile = \"${CONFIG[tuning_profile]}\""
+[[ -n "${CONFIG[tuning_profile]}" ]]  && echo "tuning_profile = $(toml_quote "${CONFIG[tuning_profile]}")"
 [[ -n "${CONFIG[workers]}" ]]         && echo "workers = ${CONFIG[workers]}"
 [[ -n "${CONFIG[channel_size]}" ]]    && echo "channel_size = ${CONFIG[channel_size]}"
 [[ -n "${CONFIG[tcp_mss]}" ]]         && echo "tcp_mss = ${CONFIG[tcp_mss]}"
 [[ -n "${CONFIG[so_rcvbuf]}" ]]       && echo "so_rcvbuf = ${CONFIG[so_rcvbuf]}"
 [[ -n "${CONFIG[so_sndbuf]}" ]]       && echo "so_sndbuf = ${CONFIG[so_sndbuf]}"
-[[ -n "${CONFIG[buffer_profile]}" ]]  && echo "buffer_profile = \"${CONFIG[buffer_profile]}\""
+[[ -n "${CONFIG[buffer_profile]}" ]]  && echo "buffer_profile = $(toml_quote "${CONFIG[buffer_profile]}")"
 [[ -n "${CONFIG[batch_size]}" ]]      && echo "batch_size = ${CONFIG[batch_size]}"
 [[ -n "${CONFIG[read_timeout]}" ]]    && echo "read_timeout = ${CONFIG[read_timeout]}"
 echo ""
@@ -1260,15 +1228,15 @@ echo "write_timeout_ms = ${CONFIG[write_timeout_ms]}"
 echo ""
 fi
 echo "[logging]"
-echo "log_level = \"${CONFIG[log_level]}\""
+echo "log_level = $(toml_quote "${CONFIG[log_level]}")"
 echo ""
 if [[ "$mode" == "server" ]] ; then
 echo "[ports]"
-[[ -n "${CONFIG[forwarder]}" ]]  && echo "forwarder = \"${CONFIG[forwarder]}\""
+[[ -n "${CONFIG[forwarder]}" ]]  && echo "forwarder = $(toml_quote "${CONFIG[forwarder]}")"
 echo "mapping = ["
 IFS=',' read -r -a ports <<< "${CONFIG[ports_mapping]}"
 for port in "${ports[@]}"; do
-[[ -n "$port" ]] && echo "    \"${port// /}\","
+[[ -n "$port" ]] && echo "    $(toml_quote "${port// /}"),"
 done
 echo "]"
 fi
@@ -1303,6 +1271,11 @@ prompt_tls_section "$mode" "${CONFIG[transport_type]}"
 prompt_tuning_section "$is_ipx" "$is_tun"
 prompt_logging_section
 prompt_ports_section "$mode" "$is_tun"
+if [[ "$mode" == "server" ]] && ! validate_port_mapping_csv "${CONFIG[ports_mapping]}" true; then
+colorize red "Invalid port mapping. Use forms such as 443, 443=5000 or 443-600:5201."
+press_key
+return 1
+fi
 local tunnel_port
 if [[ "$mode" == "server" ]]; then
 tunnel_port=$(echo "${CONFIG[bind_addr]}" | grep -oP ':\K[0-9]+$')
@@ -1312,11 +1285,21 @@ fi
 if [[ -z "$tunnel_port" ]]; then
 tunnel_port=$(echo "${CONFIG[tun_health_port]}")
 fi
+if ! validate_port_number "$tunnel_port"; then
+colorize red "Invalid tunnel/control port: ${tunnel_port}"
+press_key
+return 1
+fi
 local config_file
 if [[ "$mode" == "server" ]]; then
 config_file="${config_dir}/iran${tunnel_port}.toml"
 else
 config_file="${config_dir}/kharej${tunnel_port}.toml"
+fi
+if [[ -e "$config_file" ]]; then
+colorize red "A Backhaul tunnel already uses port ${tunnel_port} on this side. Choose a different port."
+press_key
+return 1
 fi
 generate_toml_config "$mode" "$config_file" "$is_tun" "$is_ipx"
 save_config_last_used "$mode"
@@ -1330,14 +1313,38 @@ allow_ipx_protocol_firewall "${CONFIG[ipx_profile]}"
 fi
 local config_name
 config_name=$(basename "${config_file%.toml}")
+local firewall_ok="true"
 if [[ "$mode" == "server" ]]; then
+tm_firewall_close_owner "backhaul:${config_name}:control"
+if [[ "$is_ipx" != "true" ]]; then
+tm_firewall_open_port "backhaul:${config_name}:control" "$tunnel_port" tcp || firewall_ok="false"
+elif [[ "${CONFIG[ipx_profile]}" == "tcp" || "${CONFIG[ipx_profile]}" == "udp" ]]; then
+tm_firewall_open_port "backhaul:${config_name}:control" "$tunnel_port" "${CONFIG[ipx_profile]}" || firewall_ok="false"
+fi
+if [[ "$firewall_ok" == "true" ]]; then
 if [[ "$is_tun" == "true" ]]; then
-apply_tun_port_forwarding "${CONFIG[ports_mapping]}" "${CONFIG[forwarder]}" "${CONFIG[tun_remote_addr]}" "${CONFIG[tun_name]}" "$config_name"
+apply_tun_port_forwarding "${CONFIG[ports_mapping]}" "${CONFIG[forwarder]}" "${CONFIG[tun_remote_addr]}" "${CONFIG[tun_name]}" "$config_name" || firewall_ok="false"
 else
-allow_forwarded_ports_firewall "${CONFIG[ports_mapping]}" "${CONFIG[accept_udp]}"
+allow_forwarded_ports_firewall "backhaul:${config_name}" "${CONFIG[ports_mapping]}" "${CONFIG[accept_udp]}" || firewall_ok="false"
 fi
 fi
-create_systemd_service "$service_type" "$tunnel_port" "$config_file"
+fi
+if [[ "$firewall_ok" != "true" ]]; then
+tm_firewall_close_owner "backhaul:${config_name}"
+tm_firewall_close_owner "backhaul:${config_name}:control"
+[[ "$is_tun" == "true" ]] && remove_tun_port_forwarding "${CONFIG[ports_mapping]}" "${CONFIG[forwarder]}" "${CONFIG[tun_remote_addr]}" "$config_name"
+rm -f "$config_file"
+return 1
+fi
+if ! create_systemd_service "$service_type" "$tunnel_port" "$config_file"; then
+tm_firewall_close_owner "backhaul:${config_name}"
+tm_firewall_close_owner "backhaul:${config_name}:control"
+[[ "$is_tun" == "true" ]] && remove_tun_port_forwarding "${CONFIG[ports_mapping]}" "${CONFIG[forwarder]}" "${CONFIG[tun_remote_addr]}" "$config_name"
+rm -f "$config_file" "${service_dir}/backhaul-${service_type}${tunnel_port}.service"
+systemctl daemon-reload
+colorize red "Service failed to start. Check: journalctl -eu backhaul-${service_type}${tunnel_port}.service"
+return 1
+fi
 local peer_ip_for_meta="${CONFIG[peer_ip]}"
 [[ -z "$peer_ip_for_meta" && "$is_ipx" == "true" ]] && peer_ip_for_meta="${CONFIG[ipx_dst_ip]}"
 write_tunnel_meta "$config_name" "$peer_ip_for_meta" "${CONFIG[peer_ssh_port]}"
@@ -1353,7 +1360,8 @@ local type="$1"
 local port="$2"
 local config_file="$3"
 local service_file="${service_dir}/backhaul-${type}${port}.service"
-local desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
+local desc_type
+desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
 cat > "$service_file" <<EOF
 [Unit]
 Description=Backhaul $desc_type Port $port
@@ -1373,8 +1381,10 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now "backhaul-${type}${port}.service" >/dev/null 2>&1
+if ! enable_service_checked "backhaul-${type}${port}.service"; then
+colorize red "Backhaul service backhaul-${type}${port} did not become active."
+return 1
+fi
 colorize green "✔ Service backhaul-${type}${port} created and started" bold
 }
 display_logo() {
@@ -1411,9 +1421,9 @@ cert_days=$(cert_days_remaining "$CERT_FILE")
 if (( cert_days > 30 )); then
 echo -e "\033[36mTLS Certificate:\033[0m \033[32mvalid for ${cert_days} more days\033[0m"
 elif (( cert_days > 0 )); then
-echo -e "\033[36mTLS Certificate:\033[0m \033[33mexpires in ${cert_days} days (auto-renews via watchdog)\033[0m"
+echo -e "\033[36mTLS Certificate:\033[0m \033[33mexpires in ${cert_days} days (renewal changes Hysteria/TUIC peer trust)\033[0m"
 else
-echo -e "\033[36mTLS Certificate:\033[0m \033[31mexpired (auto-renews via watchdog)\033[0m"
+echo -e "\033[36mTLS Certificate:\033[0m \033[31mexpired (peer trust must be updated after renewal)\033[0m"
 fi
 fi
 echo -e "\e[93m═══════════════════════════════════════════\e[0m"
@@ -1469,8 +1479,8 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-sudo systemctl daemon-reload
-sudo systemctl enable --now "$(basename "$service_file")"
+systemctl daemon-reload
+systemctl enable --now "$(basename "$service_file")"
 echo "Created and started $(basename "$service_file")"
 done
 fi
@@ -1649,20 +1659,27 @@ press_key
 }
 apply_ports_mapping() {
 local config_path="$1" service_name="$2" new_mapping="$3" service_path config_name backup_dir
+if ! validate_port_mapping_csv "$new_mapping" true; then
+colorize red "Invalid port mapping. Use ports/ranges from 1 to 65535."
+press_key
+return 1
+fi
 service_path="${service_dir}/${service_name}"
 config_name=$(basename "${config_path%.toml}")
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "$config_name")
 
-local is_tun="false" forwarder old_mapping tun_remote_addr tun_name
+local is_tun="false" forwarder old_mapping tun_remote_addr tun_name old_accept_udp
 tunnel_is_tun "$config_path" && is_tun="true"
 forwarder=$(toml_get "$config_path" "ports" "forwarder")
 old_mapping=$(load_toml_ports_mapping "$config_path")
+old_accept_udp=$(toml_get "$config_path" "transport" "accept_udp")
 tun_remote_addr=$(toml_get "$config_path" "tun" "remote_addr")
 tun_name=$(toml_tun_name "$config_path")
 if [[ "$is_tun" == "true" && -n "$forwarder" && "$forwarder" != "backhaul" ]]; then
 remove_tun_port_forwarding "$old_mapping" "$forwarder" "$tun_remote_addr" "$config_name"
 fi
 
+local apply_ok="true"
 awk -v newmap="$new_mapping" '
 BEGIN { n = split(newmap, arr, ",") }
 /^mapping = \[/ {
@@ -1673,21 +1690,34 @@ inarr=1; next
 inarr && /^\]/ { print; inarr=0; next }
 inarr { next }
 { print }
-' "$config_path" > "${config_path}.new" && mv "${config_path}.new" "$config_path"
+' "$config_path" > "${config_path}.new" && mv "${config_path}.new" "$config_path" || apply_ok="false"
 
+if [[ "$apply_ok" == "true" ]]; then
 if [[ "$is_tun" == "true" ]]; then
-apply_tun_port_forwarding "$new_mapping" "$forwarder" "$tun_remote_addr" "$tun_name" "$config_name"
+apply_tun_port_forwarding "$new_mapping" "$forwarder" "$tun_remote_addr" "$tun_name" "$config_name" || apply_ok="false"
 else
-allow_forwarded_ports_firewall "$new_mapping" "$(toml_get "$config_path" "transport" "accept_udp")"
+allow_forwarded_ports_firewall "backhaul:${config_name}" "$new_mapping" "$old_accept_udp" || apply_ok="false"
 fi
-systemctl restart "$service_name"
+fi
+if [[ "$apply_ok" == "true" ]]; then
+systemctl restart "$service_name" || apply_ok="false"
 sleep 2
-if systemctl is-active --quiet "$service_name"; then
+fi
+if [[ "$apply_ok" == "true" ]] && systemctl is-active --quiet "$service_name"; then
 colorize green "✔ Ports updated and service restarted."
 rm -rf "$backup_dir"
 else
 colorize red "✘ Service failed to come back up; rolling back..."
+rm -f "${config_path}.new"
+if [[ "$is_tun" == "true" && -n "$forwarder" && "$forwarder" != "backhaul" ]]; then
+remove_tun_port_forwarding "$new_mapping" "$forwarder" "$tun_remote_addr" "$config_name"
+fi
 restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
+if [[ "$is_tun" == "true" ]]; then
+apply_tun_port_forwarding "$old_mapping" "$forwarder" "$tun_remote_addr" "$tun_name" "$config_name"
+else
+allow_forwarded_ports_firewall "backhaul:${config_name}" "$old_mapping" "$old_accept_udp"
+fi
 if systemctl is-active --quiet "$service_name"; then
 colorize green "✔ Rollback succeeded."
 else
@@ -1769,9 +1799,9 @@ service_path="${service_dir}/${service_name}"
 local backup_dir
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "$config_name")
 colorize green "Current config backed up: $backup_dir"
-mv "$config_path" "${config_path}.editing"
 load_toml_into_config "${backup_dir}/config.toml"
 local old_forwarder="${CONFIG[forwarder]}" old_mapping="${CONFIG[ports_mapping]}" old_tun_remote_addr="${CONFIG[tun_remote_addr]}"
+local old_accept_udp="${CONFIG[accept_udp]}" old_ipx_profile="${CONFIG[ipx_profile]}"
 clear
 colorize cyan "Edit Tunnel: ${config_name}" bold
 echo ""
@@ -1791,7 +1821,11 @@ prompt_tls_section "$mode" "${CONFIG[transport_type]}"
 prompt_tuning_section "$is_ipx" "$is_tun"
 prompt_logging_section
 prompt_ports_section "$mode" "$is_tun"
-rm -f "${config_path}.editing"
+if [[ "$mode" == "server" ]] && ! validate_port_mapping_csv "${CONFIG[ports_mapping]}" true; then
+colorize red "Invalid port mapping."
+press_key
+return 1
+fi
 local new_port
 if [[ "$mode" == "server" ]]; then
 new_port=$(echo "${CONFIG[bind_addr]}" | grep -oP ':\K[0-9]+$')
@@ -1799,6 +1833,7 @@ else
 new_port=$(echo "${CONFIG[remote_addr]}" | grep -oP ':\K[0-9]+$')
 fi
 [[ -z "$new_port" ]] && new_port="${CONFIG[tun_health_port]}"
+validate_port_number "$new_port" || { colorize red "Invalid tunnel/control port."; press_key; return 1; }
 local prefix new_config_name new_config_path new_service_name
 [[ "$mode" == "server" ]] && prefix="iran" || prefix="kharej"
 new_config_name="${prefix}${new_port}"
@@ -1806,11 +1841,14 @@ new_config_path="${config_dir}/${new_config_name}.toml"
 new_service_name="backhaul-${new_config_name}.service"
 generate_toml_config "$mode" "$new_config_path" "$is_tun" "$is_ipx"
 save_config_last_used "$mode"
+local apply_ok="true"
 if [[ "$new_config_name" != "$config_name" ]]; then
 colorize yellow "Port changed; removing the old service and creating a new one..."
 systemctl disable --now "$service_name" >/dev/null 2>&1
 rm -f "$service_path"
 systemctl daemon-reload
+tm_firewall_close_owner "backhaul:${config_name}"
+tm_firewall_close_owner "backhaul:${config_name}:control"
 fi
 if [[ "$is_tun" == "true" ]]; then
 prepare_tun_ipx_kernel "$is_ipx" "${CONFIG[ipx_profile]}" "${CONFIG[tun_name]}"
@@ -1822,27 +1860,46 @@ if [[ -n "$old_forwarder" && "$old_forwarder" != "backhaul" ]]; then
 remove_tun_port_forwarding "$old_mapping" "$old_forwarder" "$old_tun_remote_addr" "$config_name"
 fi
 if [[ "$mode" == "server" ]]; then
+tm_firewall_close_owner "backhaul:${new_config_name}:control"
+if [[ "$is_ipx" != "true" ]]; then
+tm_firewall_open_port "backhaul:${new_config_name}:control" "$new_port" tcp || apply_ok="false"
+elif [[ "${CONFIG[ipx_profile]}" == "tcp" || "${CONFIG[ipx_profile]}" == "udp" ]]; then
+tm_firewall_open_port "backhaul:${new_config_name}:control" "$new_port" "${CONFIG[ipx_profile]}" || apply_ok="false"
+fi
+if [[ "$apply_ok" == "true" ]]; then
 if [[ "$is_tun" == "true" ]]; then
-apply_tun_port_forwarding "${CONFIG[ports_mapping]}" "${CONFIG[forwarder]}" "${CONFIG[tun_remote_addr]}" "${CONFIG[tun_name]}" "$new_config_name"
+apply_tun_port_forwarding "${CONFIG[ports_mapping]}" "${CONFIG[forwarder]}" "${CONFIG[tun_remote_addr]}" "${CONFIG[tun_name]}" "$new_config_name" || apply_ok="false"
 else
-allow_forwarded_ports_firewall "${CONFIG[ports_mapping]}" "${CONFIG[accept_udp]}"
+allow_forwarded_ports_firewall "backhaul:${new_config_name}" "${CONFIG[ports_mapping]}" "${CONFIG[accept_udp]}" || apply_ok="false"
+fi
 fi
 fi
 local peer_ip_for_meta="${CONFIG[peer_ip]}"
 [[ -z "$peer_ip_for_meta" && "$is_ipx" == "true" ]] && peer_ip_for_meta="${CONFIG[ipx_dst_ip]}"
+if [[ "$apply_ok" == "true" ]]; then
 write_tunnel_meta "$new_config_name" "$peer_ip_for_meta" "${CONFIG[peer_ssh_port]}"
-create_systemd_service "$prefix" "$new_port" "$new_config_path"
-systemctl restart "$new_service_name"
-sleep 2
-if systemctl is-active --quiet "$new_service_name"; then
+create_systemd_service "$prefix" "$new_port" "$new_config_path" || apply_ok="false"
+fi
+if [[ "$apply_ok" == "true" ]] && systemctl is-active --quiet "$new_service_name"; then
 colorize green "✔ Changes applied successfully; service is healthy."
 rm -rf "$backup_dir"
 else
 colorize red "✘ Service failed to come back up! Rolling back..."
 systemctl disable --now "$new_service_name" >/dev/null 2>&1
-rm -f "$new_config_path" "${service_dir}/${new_service_name}"
+rm -f "$new_config_path" "${service_dir}/${new_service_name}" "$(tunnel_meta_file "$new_config_name")"
 systemctl daemon-reload
 restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
+tm_firewall_close_owner "backhaul:${new_config_name}"
+tm_firewall_close_owner "backhaul:${new_config_name}:control"
+if [[ "$mode" == "server" ]]; then
+local old_port="${config_name#iran}"
+if [[ "$old_ipx_profile" == "tcp" || "$old_ipx_profile" == "udp" ]]; then
+tm_firewall_open_port "backhaul:${config_name}:control" "$old_port" "$old_ipx_profile"
+else
+tm_firewall_open_port "backhaul:${config_name}:control" "$old_port" tcp
+fi
+allow_forwarded_ports_firewall "backhaul:${config_name}" "$old_mapping" "$old_accept_udp"
+fi
 if systemctl is-active --quiet "$service_name"; then
 colorize green "✔ Rollback succeeded, tunnel restored to its previous state."
 else
@@ -2028,6 +2085,8 @@ removed_profile=$(toml_ipx_profile "$config_path")
 removed_forwarder=$(toml_get "$config_path" "ports" "forwarder")
 removed_mapping=$(load_toml_ports_mapping "$config_path")
 removed_tun_remote_addr=$(toml_get "$config_path" "tun" "remote_addr")
+tm_firewall_close_owner "backhaul:${config_name}"
+tm_firewall_close_owner "backhaul:${config_name}:control"
 if [[ -n "$removed_forwarder" && "$removed_forwarder" != "backhaul" ]]; then
 remove_tun_port_forwarding "$removed_mapping" "$removed_forwarder" "$removed_tun_remote_addr" "$config_name"
 fi

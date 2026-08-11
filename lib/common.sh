@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2154 # config_dir is provided by tunnel-manager.sh before sourcing.
 # Shared utilities used by every tunnel core (colorize/prompt helpers, TOML
 # reader, network probes, generic backup/restore, benchmark probes).
 # Sourced by tunnel-manager.sh before any core module.
@@ -35,7 +36,14 @@ local var_name="$3"
 local input
 echo -ne "[-] $prompt (default: $default): "
 read -r input
-eval "$var_name=\"${input:-$default}\""
+if [[ ! "$var_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*(\[[a-zA-Z0-9_]+\])?$ ]]; then
+colorize red "Invalid internal variable target: $var_name"
+return 1
+fi
+# printf -v performs assignment without parsing the value as shell code.  The
+# old eval-based implementation executed command substitutions/backticks from
+# passwords, tokens and other interactive values while the panel was root.
+printf -v "$var_name" '%s' "${input:-$default}"
 }
 prompt_boolean() {
 local prompt="$1"
@@ -151,6 +159,273 @@ ip=$(curl -fsS6 --max-time 2 "$url" 2>/dev/null | tr -d '[:space:]')
 done
 return 1
 }
+sha256_file() {
+local file="$1"
+if command -v sha256sum &> /dev/null; then
+sha256sum "$file" | awk '{print tolower($1)}'
+elif command -v openssl &> /dev/null; then
+openssl dgst -sha256 "$file" | awk '{print tolower($NF)}'
+else
+return 127
+fi
+}
+verify_sha256() {
+local file="$1" expected="${2,,}" label="${3:-download}"
+local actual
+if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+colorize red "No valid SHA256 is available for ${label}; refusing to install it."
+return 1
+fi
+actual=$(sha256_file "$file") || {
+colorize red "sha256sum or openssl is required to verify ${label}."
+return 1
+}
+if [[ "$actual" != "$expected" ]]; then
+colorize red "SHA256 mismatch for ${label} (expected ${expected}, got ${actual})."
+return 1
+fi
+}
+yaml_quote() {
+local value="$1"
+value="${value//\'/\'\'}"
+printf "'%s'" "$value"
+}
+yaml_unquote() {
+local value="$1"
+if [[ "$value" == \'*\' && ${#value} -ge 2 ]]; then
+value="${value:1:${#value}-2}"
+value="${value//\'\'/\'}"
+fi
+printf '%s' "$value"
+}
+validate_safe_secret() {
+local value="$1"
+(( ${#value} >= 8 && ${#value} <= 128 )) && [[ "$value" =~ ^[a-zA-Z0-9._~!@#%+,:=^-]+$ ]]
+}
+value_in_list() {
+local needle="$1" item
+shift
+for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
+return 1
+}
+toml_quote() {
+local value="$1"
+value="${value//\\/\\\\}"
+value="${value//\"/\\\"}"
+value="${value//$'\t'/\\t}"
+value="${value//$'\r'/\\r}"
+value="${value//$'\n'/\\n}"
+printf '"%s"' "$value"
+}
+github_release_asset_sha256() {
+local repo="$1" tag="$2" asset="$3" digest
+command -v jq &> /dev/null || return 1
+digest=$(curl -fsSL \
+-H 'Accept: application/vnd.github+json' \
+-H 'X-GitHub-Api-Version: 2022-11-28' \
+"https://api.github.com/repos/${repo}/releases/tags/${tag}" 2>/dev/null | \
+jq -r --arg asset "$asset" '.assets[] | select(.name == $asset) | .digest // empty' | head -1)
+digest="${digest#sha256:}"
+[[ "$digest" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+echo "${digest,,}"
+}
+validate_port_number() {
+local port="$1"
+[[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+normalize_port_spec() {
+local spec="${1// /}" allow_range="${2:-true}" start end
+if [[ "$spec" =~ ^([0-9]+)[-:]([0-9]+)$ ]]; then
+[[ "$allow_range" == "true" ]] || return 1
+start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
+validate_port_number "$start" && validate_port_number "$end" && (( 10#$start <= 10#$end )) || return 1
+echo "${start}:${end}"
+else
+validate_port_number "$spec" || return 1
+echo "$spec"
+fi
+}
+validate_port_mapping_csv() {
+local mapping="$1" allow_ranges="${2:-false}" entry listen dest
+local -a entries=()
+IFS=',' read -r -a entries <<< "$mapping"
+(( ${#entries[@]} > 0 )) || return 1
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+[[ -n "$entry" ]] || return 1
+if [[ "$entry" == *=* ]]; then
+listen="${entry%%=*}"; dest="${entry#*=}"
+elif [[ "$entry" == *:* ]]; then
+listen="${entry%%:*}"; dest="${entry#*:}"
+else
+listen="$entry"; dest="$entry"
+fi
+normalize_port_spec "$listen" "$allow_ranges" >/dev/null || return 1
+normalize_port_spec "$dest" "$allow_ranges" >/dev/null || return 1
+done
+}
+validate_port_list_csv() {
+local list="$1" allow_ranges="${2:-false}" entry
+local -a entries=()
+IFS=',' read -r -a entries <<< "$list"
+(( ${#entries[@]} > 0 )) || return 1
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+[[ "$entry" != *[=:]* ]] || return 1
+normalize_port_spec "$entry" "$allow_ranges" >/dev/null || return 1
+done
+}
+validate_host_port() {
+local value="$1" host port
+if [[ "$value" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
+host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+elif [[ "$value" =~ ^([a-zA-Z0-9._-]+):([0-9]+)$ ]]; then
+host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+else
+return 1
+fi
+[[ -n "$host" ]] && validate_port_number "$port"
+}
+validate_host_port_csv() {
+local value="$1" item
+local -a items=()
+IFS=',' read -r -a items <<< "$value"
+(( ${#items[@]} > 0 )) || return 1
+for item in "${items[@]}"; do
+item="${item// /}"
+validate_host_port "$item" || return 1
+done
+}
+validate_listen_address() {
+local value="$1"
+if [[ "$value" =~ ^:([0-9]+)$ ]]; then
+validate_port_number "${BASH_REMATCH[1]}"
+else
+validate_host_port "$value"
+fi
+}
+
+# Firewall rules created by the panel are tracked by owner.  This prevents a
+# tunnel removal from deleting an administrator's pre-existing rule and lets
+# edits remove ports that are no longer configured.
+TM_FIREWALL_STATE_DIR="${config_dir}/.firewall"
+tm_firewall_owner_key() {
+tr -c 'a-zA-Z0-9_.-' '_' <<< "$1" | tr -d '\n'
+}
+tm_firewall_state_file() {
+echo "${TM_FIREWALL_STATE_DIR}/$(tm_firewall_owner_key "$1").rules"
+}
+tm_firewall_open_port() {
+local owner="$1" raw_spec="$2" proto="$3" spec marker backend state_file
+spec=$(normalize_port_spec "$raw_spec" true) || {
+colorize red "Invalid firewall port/range: ${raw_spec}"
+return 1
+}
+[[ "$proto" == "tcp" || "$proto" == "udp" ]] || return 1
+marker="tunnel-manager:$(tm_firewall_owner_key "$owner")"
+state_file=$(tm_firewall_state_file "$owner")
+mkdir -p "$TM_FIREWALL_STATE_DIR"
+if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+backend="ufw"
+if ! ufw allow "${spec}/${proto}" comment "$marker" >/dev/null 2>&1; then
+colorize red "Failed to open ${spec}/${proto} with UFW."
+return 1
+fi
+elif command -v iptables &> /dev/null; then
+backend="iptables"
+if ! iptables -C INPUT -p "$proto" --dport "$spec" -m comment --comment "$marker" -j ACCEPT 2>/dev/null; then
+iptables -I INPUT -p "$proto" --dport "$spec" -m comment --comment "$marker" -j ACCEPT || return 1
+fi
+else
+colorize yellow "No supported firewall manager found; open ${spec}/${proto} manually."
+return 0
+fi
+grep -qxF "${owner}|${backend}|${proto}|${spec}|${marker}" "$state_file" 2>/dev/null || \
+echo "${owner}|${backend}|${proto}|${spec}|${marker}" >> "$state_file"
+[[ "$backend" == "iptables" ]] && persist_iptables_rules
+}
+tm_firewall_close_owner() {
+local owner="$1" state_file row_owner backend proto spec marker line number
+state_file=$(tm_firewall_state_file "$owner")
+[[ -f "$state_file" ]] || return 0
+while IFS='|' read -r row_owner backend proto spec marker; do
+[[ "$row_owner" == "$owner" ]] || continue
+case "$backend" in
+ufw)
+if command -v ufw &> /dev/null; then
+while line=$(ufw status numbered 2>/dev/null | grep -F "$marker" | tail -1) && [[ -n "$line" ]]; do
+number=$(sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)\].*/\1/p' <<< "$line")
+[[ -n "$number" ]] || break
+ufw --force delete "$number" >/dev/null 2>&1 || break
+done
+fi
+;;
+iptables)
+if command -v iptables &> /dev/null; then
+while iptables -C INPUT -p "$proto" --dport "$spec" -m comment --comment "$marker" -j ACCEPT 2>/dev/null; do
+iptables -D INPUT -p "$proto" --dport "$spec" -m comment --comment "$marker" -j ACCEPT 2>/dev/null || break
+done
+fi
+;;
+esac
+done < "$state_file"
+rm -f "$state_file"
+command -v iptables &> /dev/null && persist_iptables_rules
+}
+tm_firewall_sync_mapping() {
+local owner="$1" mapping="$2" protocols="$3" allow_ranges="${4:-false}"
+local entry listen proto spec
+local -a entries=() protos=()
+validate_port_mapping_csv "$mapping" "$allow_ranges" || {
+colorize red "Invalid port mapping: ${mapping}"
+return 1
+}
+tm_firewall_close_owner "$owner"
+IFS=',' read -r -a entries <<< "$mapping"
+read -r -a protos <<< "$protocols"
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+if [[ "$entry" == *=* ]]; then listen="${entry%%=*}"
+elif [[ "$entry" == *:* ]]; then listen="${entry%%:*}"
+else listen="$entry"
+fi
+spec=$(normalize_port_spec "$listen" "$allow_ranges") || return 1
+for proto in "${protos[@]}"; do
+if ! tm_firewall_open_port "$owner" "$spec" "$proto"; then
+tm_firewall_close_owner "$owner"
+return 1
+fi
+done
+done
+}
+tm_firewall_cleanup_all() {
+local f owner
+for f in "${TM_FIREWALL_STATE_DIR}"/*.rules; do
+[[ -f "$f" ]] || continue
+owner=$(head -1 "$f" | cut -d'|' -f1)
+[[ -n "$owner" ]] && tm_firewall_close_owner "$owner"
+done
+rmdir "$TM_FIREWALL_STATE_DIR" 2>/dev/null || true
+}
+service_should_run() {
+systemctl is-enabled --quiet "$1" 2>/dev/null
+}
+watchdog_restart_if_enabled() {
+local service_name="$1" log_tag="$2"
+service_should_run "$service_name" || return 0
+if ! systemctl is-active --quiet "$service_name" 2>/dev/null; then
+logger -t "$log_tag" "${service_name} is enabled but inactive, restarting" 2>/dev/null
+systemctl restart "$service_name" 2>/dev/null
+fi
+}
+enable_service_checked() {
+local service_name="$1" wait_seconds="${2:-2}"
+systemctl daemon-reload || return 1
+systemctl enable "$service_name" >/dev/null 2>&1 || return 1
+systemctl restart "$service_name" >/dev/null 2>&1 || return 1
+sleep "$wait_seconds"
+systemctl is-active --quiet "$service_name" 2>/dev/null
+}
 cert_days_remaining() {
 local cert_file="$1"
 [[ -f "$cert_file" ]] || { echo "-1"; return 1; }
@@ -167,14 +442,18 @@ local cert_file="$1" key_file="$2"
 local days
 if [[ -f "$cert_file" && -f "$key_file" ]]; then
 days=$(cert_days_remaining "$cert_file")
-if (( days > 30 )); then
+if (( days > 0 )) && openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:backhaul.com'; then
 return 1
 fi
-colorize yellow "[*] TLS certificate expires in ${days} day(s), renewing..."
+colorize yellow "[*] TLS certificate is expired or lacks the required SAN; renewing..."
 else
-colorize yellow "[*] TLS certificate or key missing, generating self-signed Ed25519 cert..."
+colorize yellow "[*] TLS certificate or key missing, generating a self-signed ECDSA cert..."
 fi
-openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 -keyout "$key_file" -out "$cert_file" -subj "/CN=backhaul.com"
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 3650 -sha256 \
+-keyout "$key_file" -out "$cert_file" -subj "/CN=backhaul.com" \
+-addext "subjectAltName=DNS:backhaul.com" || return 1
+chmod 600 "$key_file"
+chmod 644 "$cert_file"
 colorize green "[*] Generated $cert_file and $key_file"
 return 0
 }
@@ -225,12 +504,18 @@ echo "$s"
 # + IFS=,) — role is inferred from the iran/kharej filename prefix the same
 # way every core's own listing UI already does it, active from systemctl.
 emit_engine_tunnels_json() {
-local dir="$1" engine="$2" prefix="$3" ext="$4"
+local dir="$1" engine="$2" prefix="$3" ext="$4" reverse_roles="${5:-false}"
 local f name role active
 for f in "${dir}"/iran*."${ext}" "${dir}"/kharej*."${ext}"; do
 [[ -f "$f" ]] || continue
 name=$(basename "${f%."${ext}"}")
 if [[ "$name" == iran* ]]; then role="server"; else role="client"; fi
+if [[ "$reverse_roles" == "true" ]]; then
+case "$engine" in
+hysteria2) role=$(core_hysteria2_role "$f") ;;
+tuic) role=$(core_tuic_role "$f") ;;
+esac
+fi
 if systemctl is-active --quiet "${prefix}-${name}.service" 2>/dev/null; then active="true"; else active="false"; fi
 printf '{"engine":"%s","name":"%s","role":"%s","active":%s}\n' "$(json_escape "$engine")" "$(json_escape "$name")" "$role" "$active"
 done
@@ -377,18 +662,35 @@ fi
 echo "RX ${rx:-0}  TX ${tx:-0}"
 }
 backup_tunnel() {
-local config_path="$1" service_path="$2" config_name="$3" ts backup_dir
+local config_path="$1" service_path="$2" config_name="$3" ts backup_dir meta_path
 ts=$(date +%Y%m%d%H%M%S)
 backup_dir="${config_dir}/.backups/${config_name}.${ts}"
 mkdir -p "$backup_dir"
 [[ -f "$config_path" ]] && cp -p "$config_path" "$backup_dir/config.toml"
 [[ -f "$service_path" ]] && cp -p "$service_path" "$backup_dir/service.service"
+if [[ "$config_name" =~ ^[a-zA-Z0-9._-]+$ ]] && declare -F tunnel_meta_file >/dev/null; then
+printf '%s\n' "$config_name" > "$backup_dir/meta.name"
+meta_path=$(tunnel_meta_file "$config_name")
+[[ -f "$meta_path" ]] && cp -p "$meta_path" "$backup_dir/meta"
+fi
 echo "$backup_dir"
 }
 restore_tunnel_backup() {
-local backup_dir="$1" config_path="$2" service_path="$3" service_name="$4"
+local backup_dir="$1" config_path="$2" service_path="$3" service_name="$4" meta_name meta_path
 [[ -f "$backup_dir/config.toml" ]] && cp -p "$backup_dir/config.toml" "$config_path"
 [[ -f "$backup_dir/service.service" ]] && cp -p "$backup_dir/service.service" "$service_path"
+if [[ -f "$backup_dir/meta.name" ]] && declare -F tunnel_meta_file >/dev/null; then
+meta_name=$(<"$backup_dir/meta.name")
+if [[ "$meta_name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+meta_path=$(tunnel_meta_file "$meta_name")
+if [[ -f "$backup_dir/meta" ]]; then
+mkdir -p "$(dirname "$meta_path")"
+cp -p "$backup_dir/meta" "$meta_path"
+else
+rm -f "$meta_path"
+fi
+fi
+fi
 systemctl daemon-reload
 systemctl restart "$service_name" 2>/dev/null
 }

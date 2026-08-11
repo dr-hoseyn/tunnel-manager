@@ -100,7 +100,7 @@ Every other engine (4–8) opens its own submenu with the same shape: **Configur
 | | Backhaul | Rathole | GOST | Hysteria2 | FRP | TUIC |
 |---|---|---|---|---|---|---|
 | Transport | TCP / TUN+IPX | TCP | TCP/UDP | QUIC | TCP | QUIC |
-| Obfuscation against DPI | Partial (anytls/wss) | No | Via chaining | Yes (Salamander) | No | Yes (via SNI/skip-verify) |
+| Obfuscation against DPI | Partial (anytls/wss) | No | Via chaining | Yes (Salamander) | No | QUIC profile only |
 | Config depth in this panel | Highest | Low | Highest (chains) | Medium | Medium | Medium |
 | Maturity / ecosystem size | High | Medium | High | High | Very high | Medium |
 | Good on lossy/throttled links | Depends on transport | No | Depends on chain | Yes | No | Yes |
@@ -117,7 +117,7 @@ Each engine's guide (linked in the table above) covers protocol tradeoffs, secur
 
 ## Advanced usage
 
-**Editing a tunnel** (any engine, via that engine's *Tunnel management*): every field is prefilled with its current value, not a generic default — pressing Enter keeps it unchanged. Behind the scenes this backs up the current config + systemd unit, applies your changes, and automatically rolls back if the service doesn't come back healthy within a few seconds.
+**Editing a tunnel** (any engine, via that engine's *Tunnel management*): every field is prefilled with its current value, not a generic default — pressing Enter keeps it unchanged. Backhaul edits and every GOST fragment change are transactional and roll back when the service fails its health check; every engine refuses to report success unless its service is actually active.
 
 **Diagnostics**: checks the local service, pings the peer (if its IP is set), checks the peer's SSH port, and does a final end-to-end reachability check on the first forwarded port.
 
@@ -127,33 +127,29 @@ Each engine's guide (linked in the table above) covers protocol tradeoffs, secur
 
 ## Security
 
-- Every engine's binary is downloaded with checksum verification where upstream publishes one (Backhaul, Rathole, Hysteria2, FRP). TUIC's upstream (`Itsusinn/tuic`) doesn't publish checksums, so that one installs unverified over HTTPS — see [docs/tuic.md](docs/tuic.md).
-- TLS: a single self-signed cert (`/root/backhaul-core/cert_files/`) is shared by Backhaul's TLS transports, Hysteria2, and TUIC. It's checked every watchdog cycle (every 5 minutes) and auto-renewed inside 30 days of expiry, restarting whatever's using it. This is a shared-secret trust model (token/password/UUID), not CA-validated identity — there's no in-panel channel to move a cert fingerprint between two independently-managed servers, so clients are configured to skip cert verification and rely on the auth secret instead.
+- Every engine download is fail-closed on SHA-256 verification. TUIC uses GitHub's release-asset digest when an upstream checksum file is absent; Backhaul and panel updates are pinned to one immutable repository commit.
+- TLS: the shared self-signed certificate (`/root/backhaul-core/cert_files/`) has a DNS SAN and a long lifetime to avoid needless trust rotation. Hysteria2 clients require its exact SHA-256 pin; TUIC clients require a securely copied certificate and keep `skip_cert_verify = false`. Manual renewal warns that peer trust must be updated.
 - **Security & Maintenance → Enable Fail2Ban SSH protection** sets up a standard sshd jail (5 failed attempts in 10 minutes → 1 hour ban). Off by default — it changes system-wide SSH ban behavior, so it's an explicit action, not something the installer does silently.
-- Firewall rules for forwarded ports are added automatically (iptables, plus ufw if it's active) when you configure a tunnel.
+- Firewall rules are tagged and tracked per tunnel for UFW/iptables, updated on edits, and removed only when their owning tunnel is removed.
 
 ## Backups
 
-Editing or updating a tunnel automatically snapshots the current config + systemd unit into `/root/backhaul-core/.backups/` before touching anything, and rolls back automatically if the new version doesn't come up healthy. This is safety-net backup (protects you from a bad edit), not a portable export — see [Migrating to a new VPS](#migrating-to-a-new-vps) for moving a working setup elsewhere.
+Backhaul editing snapshots the config + systemd unit under `/root/backhaul-core/.backups/`. GOST snapshots `services.d`, `chains.d`, metadata, and the combined config as one transaction. Network Optimize keeps its own exact runtime/file baseline for rollback. These are safety nets, not portable exports.
 
 ## Health monitoring
 
-A systemd timer (`backhaul-watchdog.timer`) runs every 5 minutes and, per engine, restarts any tunnel service that should be running but isn't. It also renews the shared TLS cert when needed (see [Security](#security)). This installs automatically the first time you configure any tunnel — there's nothing to turn on separately.
+A systemd timer (`backhaul-watchdog.timer`) runs every 5 minutes and restarts an inactive tunnel only when its unit is enabled. A deliberately disabled tunnel stays disabled. It also checks the shared TLS certificate and restarts only enabled dependents when replacement is genuinely required.
 
 ## Network optimization
 
 **Optimize Network** (menu item 11) tunes the underlying OS/kernel network stack — this is independent of, and complementary to, each engine's own tuning options (e.g. Backhaul's `so_rcvbuf`/`so_sndbuf`/`mss`/mux settings). It applies:
 
-- Larger socket buffers (`rmem`/`wmem`, max *and* default), backlog, and connection-capacity sysctls sized for holding many concurrent tunnel connections.
-- BBR + `fq` where the kernel supports it — persisted across reboots (`/etc/modules-load.d`) and applied immediately to already-up interfaces via `tc qdisc replace` (`net.core.default_qdisc` alone only affects newly-created interfaces).
-- Connection-tracking tuning (`nf_conntrack_max`/hashsize) when the kernel/namespace exposes it — tolerated, not fatal, on containers (OpenVZ/LXC) where it doesn't.
-- Ephemeral-port reservation: every port already in `LISTEN` state (across every engine, not just Backhaul) is added to `net.ipv4.ip_local_reserved_ports`, so the deliberately wide ephemeral range this panel needs for high concurrency never gets handed out as an outgoing port that collides with a tunnel's own bind port. This is a snapshot taken at apply time — re-run it after configuring a new tunnel/port.
-- TCP keepalive tuning for long-lived tunnel connections, `tcp_fastopen`, `tcp_no_metrics_save`.
-- A systemd `DefaultLimitNOFILE` drop-in for services *other* than this panel's tunnels — every engine here already sets `LimitNOFILE=1048576` on its own systemd unit, so this only matters for unrelated services on the box.
+- Socket buffers, backlog, and conntrack capacity sized in three RAM profiles; an administrator's already-higher values are never reduced.
+- BBR + `fq` as the default for newly created qdiscs when supported. Existing interface qdiscs are not replaced live.
+- Existing `ip_local_reserved_ports` are merged with every detected TCP/UDP listener instead of overwritten.
+- A safer ephemeral range and conservative keepalive/MTU-probing settings. Riskier global `tcp_fastopen`, conntrack timeout/hashsize, PAM limits, and systemd-wide limits are left alone.
 
-Every run snapshots the prior state into `/root/backhaul-core/.backups/network-tune.<timestamp>/`, and **Roll back** in the same menu removes everything it added. Uninstalling everything also rolls this back automatically if it was ever applied.
-
-This is the same tuning as the standalone [vm-network-tuner](https://github.com/dr-hoseyn/vm-network-tuner) script, wired into this panel's menu/backup conventions instead of being a separate one-shot script.
+The first apply records every touched sysctl value and the exact prior contents/existence of managed files in `/root/backhaul-core/.network-tune-state/`. Re-applying never overwrites that baseline. **Roll back** restores those exact values and archives the snapshot under `.backups`; uninstall also invokes rollback.
 
 ## Migrating to a new VPS
 
@@ -176,7 +172,7 @@ Then re-run that engine's **Edit** flow once on the new server so the systemd se
 
 **"Remove Backhaul Core" or "Update Backhaul Core" seems to affect the wrong thing.** These only ever touch the `backhaul_premium` binary — they don't remove your tunnels or any other engine's data. If you're removing everything, use **Uninstall everything** instead.
 
-**A cert-related error after upgrading.** The shared self-signed cert auto-renews inside 30 days of expiry (see [Security](#security)); if a tunnel was mid-handshake during a renewal-triggered restart, it'll reconnect within a few seconds on its own (systemd `Restart=always`).
+**A cert-related error after certificate renewal.** Update the Hysteria2 SHA-256 pin on IRAN, or copy the new KHAREJ certificate to the path trusted by TUIC on IRAN, then restart both tunnel services. The panel warns before manual rotation because remote trust cannot be updated automatically.
 
 ## FAQ
 
@@ -203,7 +199,5 @@ When changing shared code (`lib/common.sh`, or anything in `core/backhaul/core.s
 Not yet implemented, in rough priority order:
 - One-click config export/import for VPS migration (today this is a manual file-copy, see above)
 - Multi-server management from a single interface (each install is currently fully independent)
-- A live dashboard (CPU/RAM/bandwidth/connections across all tunnels in one view)
 - Searchable audit log (who changed what, when, old value → new value)
 - Rate limiting on forwarded ports
-- FRP/TUIC checksum verification once upstream publishes one for TUIC (FRP's is already verified)
