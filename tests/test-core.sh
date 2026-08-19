@@ -60,18 +60,6 @@ assert_eq "$(yaml_unquote "$quoted")" "it's-safe"
 assert_eq "$(toml_quote 'bad"; injected=true; #')" '"bad\"; injected=true; #"'
 }
 
-test_private_backhaul_defaults() {
-[[ "$BACKHAUL_PRIVATE_IPX_PSK" =~ ^[A-Za-z0-9+/]{43}=$ ]] ||
-fail "private IPX PSK is not canonical 32-byte base64"
-assert_eq "$(printf '%s' "$BACKHAUL_PRIVATE_IPX_PSK" | base64 -d | wc -c | tr -d '[:space:]')" '32'
-[[ "$BACKHAUL_PRIVATE_TOKEN" =~ ^[a-f0-9]{64}$ ]] ||
-fail "private Backhaul token is not a 256-bit hexadecimal value"
-[[ "$BACKHAUL_PRIVATE_IPX_PSK" != 'pN9m6m0tH3nE3V8xKZ6Lq5yYcW2K1S7QG9u4cF0A8M4=' ]] ||
-fail "public Backhaul PSK is still configured"
-[[ "$BACKHAUL_PRIVATE_TOKEN" != 'your_token' ]] ||
-fail "placeholder Backhaul token is still configured"
-}
-
 test_verified_reverse_configs() {
 local hys="${TEST_ROOT}/hysteria-client.yaml" tuic="${TEST_ROOT}/tuic-client.toml"
 local pin='AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99'
@@ -191,10 +179,6 @@ mtu = 1320
 [ipx]
 mode = "server"
 profile = "tcp"
-
-[security]
-enable_encryption = true
-psk = "pN9m6m0tH3nE3V8xKZ6Lq5yYcW2K1S7QG9u4cF0A8M4="
 EOF
 meta_path=$(tunnel_meta_file 'iran1234')
 mkdir -p "$(dirname "$meta_path")"
@@ -205,25 +189,6 @@ assert_eq "${CONFIG[tun_mtu]}" '1320'
 assert_eq "${CONFIG[peer_ip]}" '192.0.2.44'
 assert_eq "${CONFIG[peer_ssh_port]}" '2222'
 assert_eq "${CONFIG[smart_auto_mtu]}" 'true'
-assert_eq "${CONFIG[psk]}" "$BACKHAUL_PRIVATE_IPX_PSK"
-}
-
-test_edit_preserves_custom_backhaul_secret() {
-local config_path="${TEST_ROOT}/custom-secret.toml" placeholder_path="${TEST_ROOT}/placeholder-secret.toml"
-cat > "$config_path" <<'EOF'
-[security]
-token = "my-existing-private-token"
-psk = "my-existing-private-psk"
-EOF
-load_toml_into_config "$config_path" custom-secret
-assert_eq "${CONFIG[token]}" 'my-existing-private-token'
-assert_eq "${CONFIG[psk]}" 'my-existing-private-psk'
-cat > "$placeholder_path" <<'EOF'
-[security]
-token = "your_token"
-EOF
-load_toml_into_config "$placeholder_path" placeholder-secret
-assert_eq "${CONFIG[token]}" "$BACKHAUL_PRIVATE_TOKEN"
 }
 
 test_ipx_diagnostics_use_live_destination() {
@@ -363,13 +328,11 @@ assert_eq "$(cat "$NETTUNE_LIMITS_CONF")" 'admin soft nofile 4096'
 
 test_safe_assignment
 test_validation_and_quoting
-test_private_backhaul_defaults
 test_verified_reverse_configs
 test_watchdog_respects_disable
 test_edit_restarts_active_service
 test_edit_cancel_keeps_live_config
 test_edit_load_uses_live_identity_and_mtu
-test_edit_preserves_custom_backhaul_secret
 test_ipx_diagnostics_use_live_destination
 test_tun_diagnostics_do_not_treat_health_port_as_http
 test_edit_follows_renamed_config

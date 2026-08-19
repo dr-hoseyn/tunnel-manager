@@ -61,7 +61,7 @@ Best-in-panel for sustained TCP throughput on a clean link, especially with `tcp
 
 ## Security
 
-- Shared-token auth (`Security Token`, plain `tcp`/`ws` transports) or, in IPX mode, full encryption (AES-256-GCM by default, PSK + KDF iterations configurable). This customized panel carries fixed owner-specific 256-bit defaults so its IRAN/KHAREJ installs match without manual copying. Because the values live in the source, anyone who can read the repository can also read them.
+- Shared-token auth (`Security Token`, plain `tcp`/`ws` transports) or, in IPX mode, full encryption (AES-256-GCM by default, PSK + KDF iterations configurable).
 - `anytls`/`wss` add TLS using the panel's shared self-signed cert (see the main [Security](../README.md#security) section) — this hides the traffic *shape* behind TLS but doesn't add certificate-based trust; the token is still the real auth boundary.
 - No protocol-level obfuscation on plain `tcp` — if DPI resistance matters more than throughput, use Hysteria2 or TUIC instead.
 

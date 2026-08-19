@@ -6,11 +6,6 @@
 # touching this file. Requires lib/common.sh to already be sourced.
 
 VALID_ALGORITHMS=("aes-256-gcm" "chacha20-poly1305" "aes-128-gcm")
-# Owner-specific fixed defaults shared by this customized panel on both ends.
-# They intentionally remain stable so IRAN/KHAREJ match without manual copying;
-# anyone who can read this source can also read these values.
-BACKHAUL_PRIVATE_IPX_PSK='CpCIWY2iTLPNL+Ou8ewfQEt4Z6Mo0hioIXnO01Vq6eA='
-BACKHAUL_PRIVATE_TOKEN='a3fb2d27e13a4477c4ce5c55e1c9d3dc56537b8bde851658371ca51370dc345b'
 # CONFIG must be associative: bare `CONFIG=()` makes it an indexed array, and
 # every non-numeric subscript (CONFIG[bind_addr], CONFIG[transport_type], ...)
 # then evaluates as an unset-variable arithmetic expression == 0, so every
@@ -856,11 +851,11 @@ colorize red "Invalid algorithm selected. Please choose one from the list."
 echo
 fi
 done
-prompt_with_default "PSK (32-byte base64)" "${CONFIG[psk]:-$BACKHAUL_PRIVATE_IPX_PSK}" CONFIG[psk]
+prompt_with_default "PSK (32-char base64)" "${CONFIG[psk]:-pN9m6m0tH3nE3V8xKZ6Lq5yYcW2K1S7QG9u4cF0A8M4=}" CONFIG[psk]
 prompt_with_default "KDF Iterations" "${CONFIG[kdf_iterations]:-100000}" CONFIG[kdf_iterations]
 fi
 else
-prompt_with_default "Security Token" "${CONFIG[token]:-$BACKHAUL_PRIVATE_TOKEN}" CONFIG[token]
+prompt_with_default "Security Token" "${CONFIG[token]:-your_token}" CONFIG[token]
 CONFIG[enable_encryption]="false"
 fi
 echo ""
@@ -1700,15 +1695,6 @@ CONFIG[algorithm]=$(toml_get "$file" "security" "algorithm")
 CONFIG[psk]=$(toml_get "$file" "security" "psk")
 CONFIG[kdf_iterations]=$(toml_get "$file" "security" "kdf_iterations")
 CONFIG[token]=$(toml_get "$file" "security" "token")
-# Upgrade only the known public/placeholder defaults during Full Edit. Custom
-# secrets remain untouched, while both servers running this private panel
-# converge on the same fixed values without manual copying.
-if [[ "${CONFIG[psk]}" == 'pN9m6m0tH3nE3V8xKZ6Lq5yYcW2K1S7QG9u4cF0A8M4=' ]]; then
-CONFIG[psk]="$BACKHAUL_PRIVATE_IPX_PSK"
-fi
-if [[ "${CONFIG[token]}" == 'your_token' ]]; then
-CONFIG[token]="$BACKHAUL_PRIVATE_TOKEN"
-fi
 CONFIG[tls_sni]=$(toml_get "$file" "tls" "sni")
 CONFIG[tls_cert]=$(toml_get "$file" "tls" "tls_cert")
 CONFIG[tls_key]=$(toml_get "$file" "tls" "tls_key")
