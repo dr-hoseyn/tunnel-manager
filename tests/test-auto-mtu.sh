@@ -17,7 +17,6 @@ AUTOMTU_BAD_STREAK_REQUIRED=1
 AUTOMTU_CHANGE_COOLDOWN=0
 AUTOMTU_REJECT_COOLDOWN=60
 AUTOMTU_MIN_SERVICE_UPTIME=0
-AUTOMTU_TRAFFIC_SAMPLE_SECONDS=1
 AUTOMTU_SETTLE_SECONDS=0
 
 # shellcheck source=../lib/common.sh
@@ -98,11 +97,11 @@ automtu_candidate_improves down 1292 30 40 1272 20 0 || fail "black-hole recover
 
 automtu_service_stable() { return 0; }
 automtu_system_load_ok() { return 0; }
-TRAFFIC_STATUS=1
-automtu_service_is_busy() { return "$TRAFFIC_STATUS"; }
 automtu_iface_mtu() { toml_get "$CURRENT_CONFIG" tun mtu; }
 APPLY_COUNT=0
 ROLLBACK_COUNT=0
+TRAFFIC_GUARD_CALLED=0
+automtu_service_is_busy() { TRAFFIC_GUARD_CALLED=1; return 0; }
 automtu_apply_candidate() {
 local config_path="$1" candidate="$4"
 AUTOMTU_BACKUP_PATH=$(mktemp "${TEST_ROOT}/candidate.XXXXXX")
@@ -140,7 +139,7 @@ automtu_save_settings "$name" true 1200 1420 20
 automtu_reset_learning "$name"
 APPLY_COUNT=0
 ROLLBACK_COUNT=0
-TRAFFIC_STATUS=1
+TRAFFIC_GUARD_CALLED=0
 HEALTH_GATE_STATUS=0
 }
 
@@ -153,20 +152,12 @@ assert_eq "$APPLY_COUNT" 0
 assert_eq "$(automtu_state_get "${AUTOMTU_STATE_DIR}/healthblock.state" last_skip none)" health-class-network-congestion
 }
 
-test_unsafe_observation_windows_are_ignored() {
-prepare_scenario busy
+test_live_vpn_traffic_uses_health_gate() {
+prepare_scenario livevpn
 PING_SCENARIO=up_good
-TRAFFIC_STATUS=0
 automtu_run_locked "$CURRENT_CONFIG" manual
-assert_eq "$APPLY_COUNT" 0
-assert_eq "$(automtu_state_get "${AUTOMTU_STATE_DIR}/busy.state" last_skip none)" traffic-high
-
-prepare_scenario telemetry
-PING_SCENARIO=up_good
-TRAFFIC_STATUS=2
-automtu_run_locked "$CURRENT_CONFIG" manual
-assert_eq "$APPLY_COUNT" 0
-assert_eq "$(automtu_state_get "${AUTOMTU_STATE_DIR}/telemetry.state" last_skip none)" traffic-telemetry-unavailable
+assert_eq "$APPLY_COUNT" 1
+assert_eq "$TRAFFIC_GUARD_CALLED" 0
 }
 
 test_watchdog_requires_repeated_evidence() {
@@ -229,7 +220,7 @@ esac
 test_settings_and_scoped_update
 test_metric_guards
 test_health_classifier_blocks_mtu_changes
-test_unsafe_observation_windows_are_ignored
+test_live_vpn_traffic_uses_health_gate
 test_watchdog_requires_repeated_evidence
 test_non_mtu_problem_is_ignored
 test_upward_candidate_requires_improvement

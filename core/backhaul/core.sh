@@ -6,6 +6,11 @@
 # touching this file. Requires lib/common.sh to already be sourced.
 
 VALID_ALGORITHMS=("aes-256-gcm" "chacha20-poly1305" "aes-128-gcm")
+# Owner-specific fixed defaults shared by this customized panel on both ends.
+# They intentionally remain stable so IRAN/KHAREJ match without manual copying;
+# anyone who can read this source can also read these values.
+BACKHAUL_PRIVATE_IPX_PSK='CpCIWY2iTLPNL+Ou8ewfQEt4Z6Mo0hioIXnO01Vq6eA='
+BACKHAUL_PRIVATE_TOKEN='a3fb2d27e13a4477c4ce5c55e1c9d3dc56537b8bde851658371ca51370dc345b'
 # CONFIG must be associative: bare `CONFIG=()` makes it an indexed array, and
 # every non-numeric subscript (CONFIG[bind_addr], CONFIG[transport_type], ...)
 # then evaluates as an unset-variable arithmetic expression == 0, so every
@@ -564,8 +569,11 @@ echo "${addr##*:}"
 }
 tunnel_peer_ip() {
 local file="$1" config_name="$2" ip
-ip=$(read_tunnel_meta "$config_name" "peer_ip")
-[[ -z "$ip" ]] && ip=$(toml_get "$file" "ipx" "dst_ip")
+# For IPX, dst_ip is part of the live tunnel config and is the authoritative
+# peer address.  Metadata may lag behind after an edit, so use it only for
+# transports that do not carry the peer address in their config.
+ip=$(toml_get "$file" "ipx" "dst_ip")
+[[ -z "$ip" ]] && ip=$(read_tunnel_meta "$config_name" "peer_ip")
 echo "$ip"
 }
 tunnel_peer_ssh_port() {
@@ -614,15 +622,10 @@ else
 colorize red "✘ ${my_label} side is not ready — ${ROLE_REASON}"
 fi
 if [[ "$is_tun" == "true" ]]; then
-local health_port health_status
+local health_port
 health_port=$(toml_get "$config_path" "tun" "health_port")
 if [[ -n "$health_port" ]]; then
-health_status=$(check_health_endpoint "$health_port")
-case "$health_status" in
-OK) colorize green "✔ Health endpoint (:${health_port}): responding" ;;
-OPEN) colorize yellow "Health endpoint (:${health_port}): port open but no HTTP response (may not be an HTTP endpoint)" ;;
-*) colorize red "✘ Health endpoint (:${health_port}): not responding" ;;
-esac
+colorize cyan "Health/control port: ${health_port} (internal; verified by the end-to-end TUN test below)"
 fi
 fi
 echo ""
@@ -673,7 +676,7 @@ if [[ "$is_tun" == "true" ]]; then
 local tun_remote
 tun_remote=$(toml_get "$config_path" "tun" "remote_addr")
 tun_remote="${tun_remote%/*}"
-if command -v ping &> /dev/null && ping -c 3 -W 2 "$tun_remote" &> /dev/null; then
+if command -v ping &> /dev/null && ping -I "$tun_name" -c 3 -W 2 "$tun_remote" &> /dev/null; then
 colorize green "✔ Tunnel is up — ${tun_remote} is reachable through the tunnel"
 result="ok"
 else
@@ -853,11 +856,11 @@ colorize red "Invalid algorithm selected. Please choose one from the list."
 echo
 fi
 done
-prompt_with_default "PSK (32-char base64)" "${CONFIG[psk]:-pN9m6m0tH3nE3V8xKZ6Lq5yYcW2K1S7QG9u4cF0A8M4=}" CONFIG[psk]
+prompt_with_default "PSK (32-byte base64)" "${CONFIG[psk]:-$BACKHAUL_PRIVATE_IPX_PSK}" CONFIG[psk]
 prompt_with_default "KDF Iterations" "${CONFIG[kdf_iterations]:-100000}" CONFIG[kdf_iterations]
 fi
 else
-prompt_with_default "Security Token" "${CONFIG[token]:-your_token}" CONFIG[token]
+prompt_with_default "Security Token" "${CONFIG[token]:-$BACKHAUL_PRIVATE_TOKEN}" CONFIG[token]
 CONFIG[enable_encryption]="false"
 fi
 echo ""
@@ -1176,6 +1179,9 @@ break
 fi
 colorize red "Destination IP cannot be empty."
 done
+# Diagnostics and metadata must follow the IPX destination selected in this
+# edit, rather than retaining the peer address loaded before the prompt.
+CONFIG[peer_ip]="${CONFIG[ipx_dst_ip]}"
 local interface
 interface="${CONFIG[ipx_interface]:-$(detect_default_interface)}"
 prompt_with_default "Network Interface" "$interface" CONFIG[ipx_interface]
@@ -1694,6 +1700,15 @@ CONFIG[algorithm]=$(toml_get "$file" "security" "algorithm")
 CONFIG[psk]=$(toml_get "$file" "security" "psk")
 CONFIG[kdf_iterations]=$(toml_get "$file" "security" "kdf_iterations")
 CONFIG[token]=$(toml_get "$file" "security" "token")
+# Upgrade only the known public/placeholder defaults during Full Edit. Custom
+# secrets remain untouched, while both servers running this private panel
+# converge on the same fixed values without manual copying.
+if [[ "${CONFIG[psk]}" == 'pN9m6m0tH3nE3V8xKZ6Lq5yYcW2K1S7QG9u4cF0A8M4=' ]]; then
+CONFIG[psk]="$BACKHAUL_PRIVATE_IPX_PSK"
+fi
+if [[ "${CONFIG[token]}" == 'your_token' ]]; then
+CONFIG[token]="$BACKHAUL_PRIVATE_TOKEN"
+fi
 CONFIG[tls_sni]=$(toml_get "$file" "tls" "sni")
 CONFIG[tls_cert]=$(toml_get "$file" "tls" "tls_cert")
 CONFIG[tls_key]=$(toml_get "$file" "tls" "tls_key")
@@ -1726,8 +1741,64 @@ fi
 fi
 press_key
 }
+is_valid_tun_forwarder() {
+case "$1" in
+backhaul|iptables|haproxy|ipvs) return 0 ;;
+*) return 1 ;;
+esac
+}
+validate_forwarder_mapping() {
+local forwarder="$1" mapping="$2" entry listen dest
+is_valid_tun_forwarder "$forwarder" || return 1
+if [[ "$forwarder" != "haproxy" && "$forwarder" != "ipvs" ]]; then
+return 0
+fi
+local -a entries=()
+IFS=',' read -r -a entries <<< "$mapping"
+for entry in "${entries[@]}"; do
+entry="${entry// /}"
+[[ -n "$entry" ]] || continue
+read -r listen dest <<< "$(parse_port_entry "$entry")"
+if [[ "$listen" == *:* ]]; then
+colorize red "${forwarder} does not support listening port ranges (${listen})."
+return 1
+fi
+done
+}
+rewrite_ports_configuration() {
+local config_path="$1" new_mapping="$2" new_forwarder="$3" tmp_file
+tmp_file="${config_path}.new"
+awk -v newmap="$new_mapping" -v newforwarder="$new_forwarder" '
+BEGIN { n = split(newmap, arr, ","); inports=0; changed_mapping=0; changed_forwarder=0 }
+/^\[/ {
+if ($0 == "[ports]") inports=1
+else if (inports) inports=0
+}
+inports && /^forwarder[[:space:]]*=/ {
+if (length(newforwarder) > 0) printf "forwarder = \"%s\"\n", newforwarder
+changed_forwarder=1
+next
+}
+inports && /^mapping[[:space:]]*=[[:space:]]*\[/ {
+if (length(newforwarder) > 0 && !changed_forwarder) {
+printf "forwarder = \"%s\"\n", newforwarder
+changed_forwarder=1
+}
+print
+for (i=1;i<=n;i++) { if (length(arr[i])>0) printf "    \"%s\",\n", arr[i] }
+inarr=1; changed_mapping=1; next
+}
+inports && inarr && /^\]/ { print; inarr=0; next }
+inports && inarr { next }
+{ print }
+END { if (!changed_mapping) exit 2 }
+' "$config_path" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+chmod --reference="$config_path" "$tmp_file" 2>/dev/null || chmod 600 "$tmp_file"
+mv -f "$tmp_file" "$config_path"
+}
 apply_ports_mapping() {
-local config_path="$1" service_name="$2" new_mapping="$3" service_path config_name backup_dir
+local config_path="$1" service_name="$2" new_mapping="$3" requested_forwarder="${4:-}"
+local service_path config_name backup_dir
 if ! validate_port_mapping_csv "$new_mapping" true; then
 colorize red "Invalid port mapping. Use ports/ranges from 1 to 65535."
 press_key
@@ -1737,53 +1808,64 @@ service_path="${service_dir}/${service_name}"
 config_name=$(basename "${config_path%.toml}")
 backup_dir=$(backup_tunnel "$config_path" "$service_path" "$config_name")
 
-local is_tun="false" forwarder old_mapping tun_remote_addr tun_name old_accept_udp
+local is_tun="false" old_forwarder new_forwarder old_mapping tun_remote_addr tun_name old_accept_udp
 tunnel_is_tun "$config_path" && is_tun="true"
-forwarder=$(toml_get "$config_path" "ports" "forwarder")
+old_forwarder=$(toml_get "$config_path" "ports" "forwarder")
+[[ "$is_tun" == "true" && -z "$old_forwarder" ]] && old_forwarder="backhaul"
+new_forwarder="${requested_forwarder:-$old_forwarder}"
+if [[ "$is_tun" == "true" ]]; then
+if ! is_valid_tun_forwarder "$new_forwarder" || ! validate_forwarder_mapping "$new_forwarder" "$new_mapping"; then
+rm -rf "$backup_dir"
+press_key
+return 1
+fi
+else
+new_forwarder=""
+fi
 old_mapping=$(load_toml_ports_mapping "$config_path")
 old_accept_udp=$(toml_get "$config_path" "transport" "accept_udp")
 tun_remote_addr=$(toml_get "$config_path" "tun" "remote_addr")
 tun_name=$(toml_tun_name "$config_path")
-if [[ "$is_tun" == "true" && -n "$forwarder" && "$forwarder" != "backhaul" ]]; then
-remove_tun_port_forwarding "$old_mapping" "$forwarder" "$tun_remote_addr" "$config_name"
+if [[ "$is_tun" == "true" ]]; then
+remove_tun_port_forwarding "$old_mapping" "$old_forwarder" "$tun_remote_addr" "$config_name"
 fi
 
 local apply_ok="true"
-awk -v newmap="$new_mapping" '
-BEGIN { n = split(newmap, arr, ",") }
-/^mapping = \[/ {
-print
-for (i=1;i<=n;i++) { if (length(arr[i])>0) printf "    \"%s\",\n", arr[i] }
-inarr=1; next
-}
-inarr && /^\]/ { print; inarr=0; next }
-inarr { next }
-{ print }
-' "$config_path" > "${config_path}.new" && mv "${config_path}.new" "$config_path" || apply_ok="false"
+rewrite_ports_configuration "$config_path" "$new_mapping" "$new_forwarder" || apply_ok="false"
 
+# Restart Backhaul on the rewritten config before activating an external
+# forwarder. This releases ports previously owned by the internal forwarder
+# and avoids HAProxy/IPVS bind conflicts during a backhaul -> external switch.
+if [[ "$apply_ok" == "true" ]]; then
+systemctl restart "$service_name" || apply_ok="false"
+sleep 2
+fi
+if [[ "$apply_ok" == "true" ]] && ! systemctl is-active --quiet "$service_name"; then
+apply_ok="false"
+fi
 if [[ "$apply_ok" == "true" ]]; then
 if [[ "$is_tun" == "true" ]]; then
-apply_tun_port_forwarding "$new_mapping" "$forwarder" "$tun_remote_addr" "$tun_name" "$config_name" || apply_ok="false"
+apply_tun_port_forwarding "$new_mapping" "$new_forwarder" "$tun_remote_addr" "$tun_name" "$config_name" || apply_ok="false"
 else
 allow_forwarded_ports_firewall "backhaul:${config_name}" "$new_mapping" "$old_accept_udp" || apply_ok="false"
 fi
 fi
 if [[ "$apply_ok" == "true" ]]; then
-systemctl restart "$service_name" || apply_ok="false"
-sleep 2
-fi
-if [[ "$apply_ok" == "true" ]] && systemctl is-active --quiet "$service_name"; then
+if [[ "$is_tun" == "true" ]]; then
+colorize green "✔ Ports and forwarder (${new_forwarder}) updated; service restarted."
+else
 colorize green "✔ Ports updated and service restarted."
+fi
 rm -rf "$backup_dir"
 else
 colorize red "✘ Service failed to come back up; rolling back..."
 rm -f "${config_path}.new"
-if [[ "$is_tun" == "true" && -n "$forwarder" && "$forwarder" != "backhaul" ]]; then
-remove_tun_port_forwarding "$new_mapping" "$forwarder" "$tun_remote_addr" "$config_name"
+if [[ "$is_tun" == "true" ]]; then
+remove_tun_port_forwarding "$new_mapping" "$new_forwarder" "$tun_remote_addr" "$config_name"
 fi
 restore_tunnel_backup "$backup_dir" "$config_path" "$service_path" "$service_name"
 if [[ "$is_tun" == "true" ]]; then
-apply_tun_port_forwarding "$old_mapping" "$forwarder" "$tun_remote_addr" "$tun_name" "$config_name"
+apply_tun_port_forwarding "$old_mapping" "$old_forwarder" "$tun_remote_addr" "$tun_name" "$config_name"
 else
 allow_forwarded_ports_firewall "backhaul:${config_name}" "$old_mapping" "$old_accept_udp"
 fi
@@ -1796,7 +1878,7 @@ fi
 press_key
 }
 edit_tunnel_ports() {
-local config_path="$1" mode="$2" config_name service_name
+local config_path="$1" mode="$2" config_name service_name new_forwarder
 if [[ "$mode" != "server" ]]; then
 colorize red "This section is only available for the IRAN (server) side."
 press_key
@@ -1808,8 +1890,15 @@ while true; do
 clear
 colorize cyan "Forwarded Ports — ${config_name}" bold
 echo ""
-local current
+local current is_tun="false" current_forwarder
 current=$(load_toml_ports_mapping "$config_path")
+tunnel_is_tun "$config_path" && is_tun="true"
+current_forwarder=$(toml_get "$config_path" "ports" "forwarder")
+[[ "$is_tun" == "true" && -z "$current_forwarder" ]] && current_forwarder="backhaul"
+if [[ "$is_tun" == "true" ]]; then
+colorize cyan "Forwarder: ${current_forwarder}"
+echo ""
+fi
 local -a ports_arr=()
 IFS=',' read -r -a ports_arr <<< "$current"
 local i=1 p
@@ -1821,6 +1910,7 @@ echo ""
 colorize green "a) Add a new port"
 colorize red "d) Remove a port"
 colorize yellow "e) Edit a port"
+[[ "$is_tun" == "true" ]] && colorize magenta "f) Change forwarder"
 echo "0) Back"
 read -r -p "Choice: " choice
 case "$choice" in
@@ -1852,6 +1942,25 @@ current=$(IFS=,; echo "${ports_arr[*]}")
 apply_ports_mapping "$config_path" "$service_name" "$current"
 else
 colorize red "Invalid choice"; sleep 1
+fi
+;;
+f)
+if [[ "$is_tun" == "true" ]]; then
+echo "Available: backhaul, iptables, haproxy, ipvs"
+prompt_with_default "New forwarder" "$current_forwarder" new_forwarder
+new_forwarder="${new_forwarder,,}"
+if is_valid_tun_forwarder "$new_forwarder"; then
+if [[ "$new_forwarder" == "$current_forwarder" ]]; then
+colorize yellow "Forwarder is already ${current_forwarder}."; sleep 1
+else
+apply_ports_mapping "$config_path" "$service_name" "$current" "$new_forwarder"
+fi
+else
+colorize red "Invalid forwarder. Choose: backhaul, iptables, haproxy, or ipvs."
+sleep 2
+fi
+else
+colorize red "Forwarder selection is available only for TUN tunnels."; sleep 2
 fi
 ;;
 0) return ;;
@@ -1964,6 +2073,7 @@ fi
 if [[ "$new_config_name" != "$config_name" ]]; then
 automtu_delete_state "$config_name" 2>/dev/null || true
 tunnel_health_delete "$config_name" 2>/dev/null || true
+rm -f "$config_path" "$(tunnel_meta_file "$config_name")" "${config_dir}/.status/${config_name}.status"
 fi
 colorize green "✔ Changes applied successfully; service is healthy."
 rm -rf "$backup_dir"
@@ -1993,6 +2103,7 @@ press_key
 return 1
 fi
 echo ""
+EDITED_CONFIG_PATH="$new_config_path"
 run_tunnel_diagnostics "$new_config_path"
 }
 edit_tunnel() {
@@ -2010,7 +2121,7 @@ colorize yellow "3) Enable/disable tunnel"
 echo "0) Back"
 read -r -p "Choice: " choice
 case "$choice" in
-1) edit_tunnel_full "$config_path" "$mode" ;;
+1) EDITED_CONFIG_PATH="$config_path"; edit_tunnel_full "$config_path" "$mode" ;;
 2) [[ "$role" == "server" ]] && edit_tunnel_ports "$config_path" "$mode" ;;
 3) toggle_tunnel_enabled "$service_name" ;;
 0) return ;;
@@ -2265,7 +2376,15 @@ echo "0) Back"
 echo ""
 read -r -p "Choice: " choice
 case "$choice" in
-1) edit_tunnel "$config_path" ;;
+1)
+EDITED_CONFIG_PATH="$config_path"
+edit_tunnel "$config_path"
+if [[ -n "${EDITED_CONFIG_PATH:-}" && -f "$EDITED_CONFIG_PATH" ]]; then
+config_path="$EDITED_CONFIG_PATH"
+config_name=$(basename "${config_path%.toml}")
+service_name="backhaul-${config_name}.service"
+fi
+;;
 2) run_tunnel_diagnostics "$config_path" ;;
 3) benchmark_tunnel_protocols "$config_path" ;;
 4) view_service_logs "$service_name" ;;

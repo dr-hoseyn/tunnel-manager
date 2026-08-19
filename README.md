@@ -159,7 +159,8 @@ The controller follows a conservative probe/confirm/rollback state machine inspi
 - A small control probe must first show that the tunnel and general network are healthy. If small packets also fail, MTU is not blamed and nothing is changed.
 - Lowering requires two consecutive size-specific failure samples; raising requires three consecutive healthy samples.
 - A candidate is tested against the current MTU as an A/B probe. It is accepted only when delivery score improves and the small control path remains healthy; otherwise the exact config is restored and the service restarted on its previous MTU.
-- Automatic changes are skipped while service traffic exceeds 256 KiB/s, system load is high, traffic accounting is unavailable, the service has been up for less than ten minutes, or the controller is in cooldown.
+- Normal live VPN traffic does not block evaluation. The controller relies on Tunnel Health to reject congestion, packet loss, interface errors, and resource pressure instead of waiting for an idle tunnel or depending on incomplete systemd service-byte counters.
+- Automatic changes are skipped while Tunnel Health reports congestion, loss, interface/resource trouble, while system load is high, while the service has been up for less than ten minutes, or while the controller is in cooldown.
 - Defaults are `1200-1420` with a `20` byte step. Hard safety limits are `1000-1500`. An accepted or rejected candidate changes at most one step per evaluation; a rejected upward probe closes upward exploration until learning is manually reset.
 
 State is stored per tunnel under `/root/backhaul-core/.auto-mtu/`. The tunnel detail page shows the latest baseline, skip reason, accepted/rejected decision, and provides a safe one-shot evaluation, enable/disable control, bound editing, and learning reset.

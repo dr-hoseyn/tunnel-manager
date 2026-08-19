@@ -630,23 +630,6 @@ echo "${avg:-NA} ${loss:-NA}"
 tun_iface_exists() {
 ip link show "$1" &>/dev/null
 }
-check_health_endpoint() {
-local port="$1" http_code
-[[ -z "$port" ]] && { echo "N/A"; return 1; }
-if command -v curl &> /dev/null; then
-http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${port}/" 2>/dev/null)
-if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-echo "OK"
-return 0
-fi
-fi
-if tcp_port_open "127.0.0.1" "$port" 2; then
-echo "OPEN"
-return 0
-fi
-echo "DOWN"
-return 1
-}
 tunnel_traffic_stats() {
 local service_name="$1" rx tx
 rx=$(systemctl show "$service_name" -p IPIngressBytes --value 2>/dev/null)
