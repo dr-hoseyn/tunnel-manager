@@ -31,8 +31,6 @@ The result is a single root-cause classification with a confidence score. Ambigu
 
 TUN/IPX can enable a per-tunnel adaptive MTU controller. It does not react to ordinary packet loss by blindly lowering MTU. A small probe first verifies that the general tunnel path is healthy; only a repeatable difference between small and near-MTU probes is considered size-specific evidence.
 
-Continuous VPN traffic is supported: Auto-MTU uses the Tunnel Health classification to reject unsafe congestion or resource-pressure windows, rather than requiring the tunnel to become idle or relying on systemd service traffic counters that may not include forwarded VPN packets.
-
 - Defaults: current `1320`, allowed range `1200-1420`, step `20` (all configurable).
 - Downward change: two consecutive black-hole/large-packet failures while small probes remain healthy.
 - Upward change: three consecutive clean checks, followed by a larger candidate probe.
@@ -70,8 +68,6 @@ Best-in-panel for sustained TCP throughput on a clean link, especially with `tcp
 - You control both ends and the link isn't actively filtered — maximize throughput.
 - You need TUN-level forwarding (UDP services, whole port ranges, or a specific forwarder engine's health-checking).
 - You're already running Backhaul and it works — the panel's backward-compatibility guarantee means upgrading the panel never changes how existing Backhaul tunnels behave.
-
-On the IRAN side, **Edit tunnel > Manage forwarded ports** can change both individual port mappings and the active TUN forwarder (`backhaul`, `iptables`, `haproxy`, or `ipvs`). The switch is transactional: the previous config and forwarding rules are restored if the replacement cannot start cleanly.
 
 ## When not to use it
 

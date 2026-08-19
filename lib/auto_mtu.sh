@@ -17,6 +17,8 @@ AUTOMTU_BAD_STREAK_REQUIRED="${AUTOMTU_BAD_STREAK_REQUIRED:-2}"
 AUTOMTU_CHANGE_COOLDOWN="${AUTOMTU_CHANGE_COOLDOWN:-21600}"
 AUTOMTU_REJECT_COOLDOWN="${AUTOMTU_REJECT_COOLDOWN:-86400}"
 AUTOMTU_MIN_SERVICE_UPTIME="${AUTOMTU_MIN_SERVICE_UPTIME:-600}"
+AUTOMTU_MAX_RATE_BPS="${AUTOMTU_MAX_RATE_BPS:-262144}"
+AUTOMTU_TRAFFIC_SAMPLE_SECONDS="${AUTOMTU_TRAFFIC_SAMPLE_SECONDS:-1}"
 AUTOMTU_SETTLE_SECONDS="${AUTOMTU_SETTLE_SECONDS:-5}"
 AUTOMTU_SMALL_PAYLOAD="${AUTOMTU_SMALL_PAYLOAD:-64}"
 AUTOMTU_SMALL_MAX_LOSS="${AUTOMTU_SMALL_MAX_LOSS:-10}"
@@ -132,6 +134,25 @@ local load_one cpu_count
 read -r load_one _ < /proc/loadavg || return 1
 cpu_count=$(nproc 2>/dev/null || printf '1')
 awk -v load_value="$load_one" -v cpus="$cpu_count" 'BEGIN { exit !(load_value <= cpus * 1.5) }'
+}
+
+automtu_service_bytes() {
+local service_name="$1" rx tx
+rx=$(systemctl show "$service_name" -p IPIngressBytes --value 2>/dev/null)
+tx=$(systemctl show "$service_name" -p IPEgressBytes --value 2>/dev/null)
+[[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]] || return 1
+[[ "$rx" != "18446744073709551615" && "$tx" != "18446744073709551615" ]] || return 1
+printf '%s\n' "$((rx + tx))"
+}
+
+automtu_service_is_busy() {
+local service_name="$1" before after delta
+before=$(automtu_service_bytes "$service_name") || return 2
+sleep "$AUTOMTU_TRAFFIC_SAMPLE_SECONDS"
+after=$(automtu_service_bytes "$service_name") || return 2
+(( after >= before )) || return 2
+delta=$(( (after - before) / AUTOMTU_TRAFFIC_SAMPLE_SECONDS ))
+(( delta > AUTOMTU_MAX_RATE_BPS ))
 }
 
 automtu_iface_mtu() {
@@ -275,10 +296,15 @@ return 0
 fi
 fi
 automtu_system_load_ok || { automtu_record_skip "$state_file" "system-load-high"; return 0; }
-# A VPN tunnel normally carries traffic continuously, and forwarded packets
-# are not reliably represented by systemd's per-service IP byte counters.
-# Tunnel Health has already rejected congestion, loss, interface errors and
-# resource pressure above, so ordinary live TUN traffic is safe probe context.
+local traffic_status
+if automtu_service_is_busy "$service_name"; then traffic_status=0; else traffic_status=$?; fi
+if (( traffic_status == 0 )); then
+automtu_record_skip "$state_file" "traffic-high"
+return 0
+elif (( traffic_status == 2 )); then
+automtu_record_skip "$state_file" "traffic-telemetry-unavailable"
+return 0
+fi
 
 now=$(date +%s)
 cooldown=$(automtu_state_get "$state_file" cooldown_until "0")
