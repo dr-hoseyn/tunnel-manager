@@ -422,9 +422,16 @@ enable_service_checked() {
 local service_name="$1" wait_seconds="${2:-2}"
 systemctl daemon-reload || return 1
 systemctl enable "$service_name" >/dev/null 2>&1 || return 1
+if declare -F core_optimize_sync_for_tunnel >/dev/null; then
+core_optimize_sync_for_tunnel before "$service_name" || true
+fi
 systemctl restart "$service_name" >/dev/null 2>&1 || return 1
 sleep "$wait_seconds"
-systemctl is-active --quiet "$service_name" 2>/dev/null
+systemctl is-active --quiet "$service_name" 2>/dev/null || return 1
+if declare -F core_optimize_sync_for_tunnel >/dev/null; then
+core_optimize_sync_for_tunnel after "$service_name" || true
+fi
+return 0
 }
 cert_days_remaining() {
 local cert_file="$1"

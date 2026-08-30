@@ -34,8 +34,8 @@ TUN/IPX can enable a per-tunnel adaptive MTU controller. It does not react to or
 - Defaults: current `1320`, allowed range `1200-1420`, step `20` (all configurable).
 - Downward change: two consecutive black-hole/large-packet failures while small probes remain healthy.
 - Upward change: three consecutive clean checks, followed by a larger candidate probe.
-- Every candidate restarts the service only during low traffic, runs an A/B comparison, and is kept only if its delivery score improves. Failure, ambiguous results, or a degraded small probe cause immediate rollback.
-- Checks pause on high traffic, high CPU load, missing systemd traffic accounting, a recently restarted service, or cooldown. This is deliberately slower than an aggressive optimizer because avoiding a wrong change matters more than finding the theoretical maximum quickly.
+- Every candidate restarts the service, runs an A/B comparison, and is kept only if its delivery score improves. Failure, ambiguous results, or a degraded small probe cause immediate rollback.
+- High traffic remains a caution signal rather than a permanent block: watchdog mode requires two additional consecutive evidence samples before changing MTU, while a manual one-shot check may proceed immediately. Checks still pause on high CPU load, missing systemd traffic accounting, a recently restarted service, or cooldown.
 - The Tunnel Health gate must also report `healthy` or `mtu-suspected`; stale or unrelated diagnoses fail closed.
 
 Open **Tunnel management**, select the IPX tunnel, then choose **Smart Auto-MTU** to run one guarded evaluation, toggle automation, change limits, or reset learned history. Both ends should use compatible bounds; each side still evaluates its own outbound path independently.

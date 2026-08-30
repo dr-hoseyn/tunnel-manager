@@ -1769,11 +1769,17 @@ allow_forwarded_ports_firewall "backhaul:${config_name}" "$new_mapping" "$old_ac
 fi
 fi
 if [[ "$apply_ok" == "true" ]]; then
+if declare -F core_optimize_sync_for_tunnel >/dev/null; then
+core_optimize_sync_for_tunnel before "$service_name" || true
+fi
 systemctl restart "$service_name" || apply_ok="false"
 sleep 2
 fi
 if [[ "$apply_ok" == "true" ]] && systemctl is-active --quiet "$service_name"; then
 colorize green "✔ Ports updated and service restarted."
+if declare -F core_optimize_sync_for_tunnel >/dev/null; then
+core_optimize_sync_for_tunnel after "$service_name" || true
+fi
 rm -rf "$backup_dir"
 else
 colorize red "✘ Service failed to come back up; rolling back..."

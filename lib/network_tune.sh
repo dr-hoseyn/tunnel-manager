@@ -13,6 +13,7 @@ NETTUNE_LIMITS_TAG="tunnel-manager-network-tune"
 NETTUNE_STATE_DIR="${config_dir}/.network-tune-state"
 NETTUNE_VALUES_FILE="${NETTUNE_STATE_DIR}/sysctl-values.tsv"
 NETTUNE_LAST_BACKUP_FILE="${config_dir}/.network-tune-last-backup"
+NETTUNE_LOCK_FILE="${config_dir}/.network-tune.lock"
 
 core_optimize_is_applied() {
 [[ -f "$NETTUNE_SYSCTL_CONF" ]]
@@ -37,6 +38,38 @@ cp -a -- "${NETTUNE_STATE_DIR}/${name}.backup" "$path"
 else
 rm -f -- "$path"
 fi
+}
+
+nettune_file_signature() {
+local path="$1" digest
+if [[ ! -e "$path" ]]; then
+printf '0\n'
+return 0
+fi
+digest=$(sha256_file "$path" 2>/dev/null) || return 1
+printf '1\t%s\n' "$digest"
+}
+
+# Rollback must not overwrite an administrator's edits made after Optimize.
+# The no-signature path keeps compatibility with snapshots from older builds.
+nettune_record_applied_file() {
+local path="$1" name="$2"
+nettune_file_signature "$path" > "${NETTUNE_STATE_DIR}/${name}.applied"
+}
+
+nettune_restore_file_if_unchanged() {
+local path="$1" name="$2" expected current
+if [[ ! -f "${NETTUNE_STATE_DIR}/${name}.applied" ]]; then
+nettune_restore_file "$path" "$name"
+return $?
+fi
+expected=$(<"${NETTUNE_STATE_DIR}/${name}.applied")
+current=$(nettune_file_signature "$path") || return 1
+if [[ "$current" != "$expected" ]]; then
+colorize yellow "Skipped changed file during rollback: $path"
+return 2
+fi
+nettune_restore_file "$path" "$name"
 }
 
 nettune_keys() {
@@ -98,15 +131,41 @@ printf '%s' "$proposed"
 fi
 }
 
+nettune_baseline_value() {
+local key="$1"
+awk -F '\t' -v wanted="$key" '
+$1 == wanted { found=1; print substr($0, index($0, "\t") + 1); exit }
+END { if (!found) exit 1 }
+' "$NETTUNE_VALUES_FILE" 2>/dev/null
+}
+
 nettune_merge_reserved_ports() {
 local current listening
+# Always rebuild from the pre-Optimize baseline. Using the current runtime
+# value would make ports from deleted tunnels accumulate on every re-apply.
+if ! current=$(nettune_baseline_value net.ipv4.ip_local_reserved_ports); then
 current=$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)
+fi
 listening=$( { ss -Htln 2>/dev/null; ss -Huln 2>/dev/null; } |
 awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | paste -sd, - )
 
 printf '%s\n%s\n' "$current" "$listening" |
 tr ',' '\n' | awk 'NF && $0 ~ /^[0-9]+(-[0-9]+)?$/ { if (!seen[$0]++) print $0 }' |
 sort -V | paste -sd, -
+}
+
+nettune_verify_config() {
+local conf="$1" line key expected actual
+while IFS= read -r line; do
+[[ "$line" == *=* && "$line" != \#* ]] || continue
+key="${line%%=*}"
+expected="${line#*=}"
+key="${key//[[:space:]]/}"
+expected=$(awk '{$1=$1; print}' <<< "$expected")
+actual=$(sysctl -n "$key" 2>/dev/null) || return 1
+actual=$(awk '{$1=$1; print}' <<< "$actual")
+[[ "$actual" == "$expected" ]] || return 1
+done < "$conf"
 }
 
 nettune_remove_legacy_global_limits() {
@@ -127,6 +186,12 @@ colorize cyan "--- Optimize Network (safe and reversible) ---" bold
 echo ""
 
 local bbr_ok=0 conntrack_ok=0
+if ! nettune_capture_baseline; then
+colorize red "Could not save the pre-optimization state. Nothing was changed."
+return 1
+fi
+# Loading BBR is itself a runtime change, so it must happen after the baseline
+# is safely stored.
 if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
 modprobe tcp_bbr 2>/dev/null || true
 fi
@@ -134,11 +199,6 @@ if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bb
 bbr_ok=1
 fi
 [[ -e "$NETTUNE_CONNTRACK_PATH" ]] && conntrack_ok=1
-
-if ! nettune_capture_baseline; then
-colorize red "Could not save the pre-optimization state. Nothing was changed."
-return 1
-fi
 nettune_remove_legacy_global_limits
 
 local memory_kb buffer_max tcp_buffer conntrack_max backlog
@@ -230,7 +290,17 @@ core_optimize_rollback
 return 1
 fi
 
-if ! sysctl -e -p "$NETTUNE_SYSCTL_CONF" >/dev/null; then
+# Fingerprint the files as written. Rollback uses these signatures to avoid
+# clobbering later administrator changes.
+if ! nettune_record_applied_file "$NETTUNE_SYSCTL_CONF" sysctl-conf ||
+! nettune_record_applied_file "$NETTUNE_BBR_MODULE_CONF" bbr-module ||
+! nettune_record_applied_file "$NETTUNE_SYSTEMD_LIMIT_CONF" systemd-limit; then
+colorize red "Could not record the applied file state; restoring the saved state."
+core_optimize_rollback
+return 1
+fi
+
+if ! sysctl -e -p "$NETTUNE_SYSCTL_CONF" >/dev/null || ! nettune_verify_config "$NETTUNE_SYSCTL_CONF"; then
 colorize red "Kernel rejected one or more tuning values; restoring the saved state."
 core_optimize_rollback
 return 1
@@ -245,8 +315,35 @@ echo "somaxconn:           $(sysctl -n net.core.somaxconn 2>/dev/null || echo n/
 [[ "$conntrack_ok" == "1" ]] && echo "conntrack max:       $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
 [[ -n "$reserved_ports" ]] && echo "Reserved ports:      $reserved_ports"
 echo ""
-colorize yellow "Re-run Optimize after adding listeners so their ports are merged into the reservation list."
+colorize yellow "Tunnel listeners sync automatically; re-run Optimize after adding external listeners."
 colorize yellow "No active qdisc, global PAM limit, or global systemd limit is modified."
+}
+
+# Tunnel setup calls this before and after restarting a service: the first pass
+# makes new sockets inherit BBR, while the second captures the new listener in
+# ip_local_reserved_ports. Optimization remains secondary to tunnel health.
+core_optimize_sync_for_tunnel() {
+local phase="${1:-after}" subject="${2:-tunnel}" lock_fd result
+mkdir -p "$config_dir" || return 1
+if command -v flock >/dev/null; then
+exec {lock_fd}>"$NETTUNE_LOCK_FILE"
+if ! flock -w 15 "$lock_fd"; then
+exec {lock_fd}>&-
+return 1
+fi
+fi
+if core_optimize_apply >/dev/null 2>&1; then result=0; else result=$?; fi
+if [[ -n "${lock_fd:-}" ]]; then
+flock -u "$lock_fd" 2>/dev/null || true
+exec {lock_fd}>&-
+fi
+if (( result == 0 )); then
+logger -t tunnel-manager "network optimization synced (${phase}): ${subject}" 2>/dev/null || true
+return 0
+fi
+logger -t tunnel-manager "network optimization sync failed (${phase}): ${subject}" 2>/dev/null || true
+[[ "$phase" == "after" ]] && colorize yellow "Tunnel is active, but automatic network optimization failed; use option 11 to inspect or retry."
+return 1
 }
 
 core_optimize_rollback() {
@@ -264,13 +361,23 @@ fi
 return 0
 fi
 
-nettune_restore_file "$NETTUNE_SYSCTL_CONF" sysctl-conf
-nettune_restore_file "$NETTUNE_BBR_MODULE_CONF" bbr-module
-nettune_restore_file "$NETTUNE_SYSTEMD_LIMIT_CONF" systemd-limit
-nettune_restore_file "$NETTUNE_LIMITS_CONF" limits-conf
+local restore_failed=0 restore_status restore_spec
+for restore_spec in \
+"$NETTUNE_SYSCTL_CONF|sysctl-conf" \
+"$NETTUNE_BBR_MODULE_CONF|bbr-module" \
+"$NETTUNE_SYSTEMD_LIMIT_CONF|systemd-limit"; do
+if nettune_restore_file_if_unchanged "${restore_spec%%|*}" "${restore_spec#*|}"; then
+restore_status=0
+else
+restore_status=$?
+fi
+(( restore_status == 0 )) || restore_failed=1
+done
+# limits.conf is a shared administrator-owned file. Older releases may have
+# placed one tagged block there, but rollback never replaces the whole file.
 sysctl --system >/dev/null 2>&1 || true
 
-local key value restore_failed=0
+local key value
 while IFS=$'\t' read -r key value; do
 [[ -n "$key" ]] || continue
 if ! sysctl -w "${key}=${value}" >/dev/null 2>&1; then

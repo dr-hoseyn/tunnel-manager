@@ -102,6 +102,7 @@ declare -A SYSVALS=(
 SERVICE_ENABLED="false"
 SERVICE_ACTIVE="false"
 RESTART_COUNT=0
+OPTIMIZE_SYNC_COUNT=0
 
 sysctl() {
 local action="${1:-}"
@@ -141,7 +142,9 @@ esac
 }
 logger() { :; }
 modprobe() { :; }
-ss() { printf 'LISTEN 0 128 0.0.0.0:8443 0.0.0.0:*\n'; }
+LISTEN_PORT=8443
+ss() { printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:*\n' "$LISTEN_PORT"; }
+core_optimize_sync_for_tunnel() { OPTIMIZE_SYNC_COUNT=$((OPTIMIZE_SYNC_COUNT + 1)); }
 
 test_watchdog_respects_disable() {
 SERVICE_ENABLED="false"; SERVICE_ACTIVE="false"; RESTART_COUNT=0
@@ -153,9 +156,10 @@ assert_eq "$RESTART_COUNT" '1'
 }
 
 test_edit_restarts_active_service() {
-SERVICE_ENABLED="true"; SERVICE_ACTIVE="true"; RESTART_COUNT=0
+SERVICE_ENABLED="true"; SERVICE_ACTIVE="true"; RESTART_COUNT=0; OPTIMIZE_SYNC_COUNT=0
 enable_service_checked 'example.service' 0 || fail "active service was not restarted cleanly"
 assert_eq "$RESTART_COUNT" '1'
+assert_eq "$OPTIMIZE_SYNC_COUNT" '2'
 }
 
 test_edit_cancel_keeps_live_config() {
@@ -261,10 +265,17 @@ assert_eq "${SYSVALS[net.ipv4.tcp_congestion_control]}" 'bbr'
 assert_eq "$(cat "$NETTUNE_LIMITS_CONF")" 'admin soft nofile 4096'
 [[ ! -f "$NETTUNE_SYSTEMD_LIMIT_CONF" ]] || fail "global systemd limit was created"
 
+LISTEN_PORT=9443
+core_optimize_apply >/dev/null
+assert_file_contains "$NETTUNE_SYSCTL_CONF" 'net.ipv4.ip_local_reserved_ports = 9000,9443'
+! grep -qF '8443' "$NETTUNE_SYSCTL_CONF" || fail "stale listener remained reserved after re-apply"
+
+printf 'admin soft nofile 4096\noperator hard nofile 8192\n' > "$NETTUNE_LIMITS_CONF"
+
 core_optimize_rollback >/dev/null
 assert_eq "${SYSVALS[net.core.rmem_max]}" "$old_rmem"
 assert_eq "${SYSVALS[net.ipv4.tcp_congestion_control]}" "$old_cc"
-assert_eq "$(cat "$NETTUNE_LIMITS_CONF")" 'admin soft nofile 4096'
+assert_eq "$(tail -1 "$NETTUNE_LIMITS_CONF")" 'operator hard nofile 8192'
 [[ ! -d "$NETTUNE_STATE_DIR" ]] || fail "rollback state was not archived"
 }
 

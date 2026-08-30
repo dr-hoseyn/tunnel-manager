@@ -159,7 +159,7 @@ The controller follows a conservative probe/confirm/rollback state machine inspi
 - A small control probe must first show that the tunnel and general network are healthy. If small packets also fail, MTU is not blamed and nothing is changed.
 - Lowering requires two consecutive size-specific failure samples; raising requires three consecutive healthy samples.
 - A candidate is tested against the current MTU as an A/B probe. It is accepted only when delivery score improves and the small control path remains healthy; otherwise the exact config is restored and the service restarted on its previous MTU.
-- Automatic changes are skipped while service traffic exceeds 256 KiB/s, system load is high, traffic accounting is unavailable, the service has been up for less than ten minutes, or the controller is in cooldown.
+- High traffic no longer disables learning indefinitely: the controller keeps collecting probes and requires two extra consecutive healthy/bad samples before an automatic change. Missing traffic accounting, high system load, a service uptime below ten minutes, or cooldown still pauses changes; a manual one-shot evaluation can run during high traffic.
 - Defaults are `1200-1420` with a `20` byte step. Hard safety limits are `1000-1500`. An accepted or rejected candidate changes at most one step per evaluation; a rejected upward probe closes upward exploration until learning is manually reset.
 
 State is stored per tunnel under `/root/backhaul-core/.auto-mtu/`. The tunnel detail page shows the latest baseline, skip reason, accepted/rejected decision, and provides a safe one-shot evaluation, enable/disable control, bound editing, and learning reset.
@@ -173,7 +173,9 @@ State is stored per tunnel under `/root/backhaul-core/.auto-mtu/`. The tunnel de
 - Existing `ip_local_reserved_ports` are merged with every detected TCP/UDP listener instead of overwritten.
 - A safer ephemeral range and conservative keepalive/MTU-probing settings. Riskier global `tcp_fastopen`, conntrack timeout/hashsize, PAM limits, and systemd-wide limits are left alone.
 
-The first apply records every touched sysctl value and the exact prior contents/existence of managed files in `/root/backhaul-core/.network-tune-state/`. Re-applying never overwrites that baseline. **Roll back** restores those exact values and archives the snapshot under `.backups`; uninstall also invokes rollback.
+Optimization is synchronized automatically before and after every successful tunnel create/edit. The pre-start pass makes new sockets inherit the selected congestion control; the post-start pass adds the newly listening ports to the reservation list. Menu item 11 remains available for status, a manual retry/re-apply, and rollback.
+
+The first apply records every touched sysctl value and the exact prior contents/existence of managed files in `/root/backhaul-core/.network-tune-state/`. Re-applying never overwrites that baseline and rebuilds reserved ports from the baseline plus current listeners, so removed tunnel ports do not accumulate. **Roll back** restores those values and manager-owned files, but refuses to overwrite a file that an administrator changed after optimization; shared `limits.conf` is never replaced wholesale. A partial rollback keeps its state for a safe retry. Successful rollback archives the snapshot under `.backups`; uninstall also invokes rollback.
 
 ## Migrating to a new VPS
 

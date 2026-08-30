@@ -63,7 +63,7 @@ same-numbered Backhaul tunnel.
 Backhaul's adaptive TUN/IPX MTU state machine lives separately in
 `lib/auto_mtu.sh`. It is sourced before the core modules, stores only panel
 state under `.auto-mtu` (never unknown keys in Backhaul's TOML), and is called
-from Backhaul's watchdog/detail UI. Keep its control-probe, low-traffic,
+from Backhaul's watchdog/detail UI. Keep its control-probe, traffic-aware,
 cooldown, bounded-step, A/B confirmation, and rollback gates intact when
 changing the policy; they prevent unrelated network failures from being
 misdiagnosed as MTU failures.

@@ -153,13 +153,23 @@ assert_eq "$APPLY_COUNT" 0
 assert_eq "$(automtu_state_get "${AUTOMTU_STATE_DIR}/healthblock.state" last_skip none)" health-class-network-congestion
 }
 
-test_unsafe_observation_windows_are_ignored() {
+test_busy_servers_keep_learning() {
 prepare_scenario busy
 PING_SCENARIO=up_good
 TRAFFIC_STATUS=0
 automtu_run_locked "$CURRENT_CONFIG" manual
+assert_eq "$APPLY_COUNT" 1
+assert_eq "$(automtu_state_get "${AUTOMTU_STATE_DIR}/busy.state" last_traffic none)" high
+
+prepare_scenario busywatchdog
+PING_SCENARIO=up_good
+TRAFFIC_STATUS=0
+AUTOMTU_GOOD_STREAK_REQUIRED=1
+automtu_run_locked "$CURRENT_CONFIG" watchdog
+automtu_run_locked "$CURRENT_CONFIG" watchdog
 assert_eq "$APPLY_COUNT" 0
-assert_eq "$(automtu_state_get "${AUTOMTU_STATE_DIR}/busy.state" last_skip none)" traffic-high
+automtu_run_locked "$CURRENT_CONFIG" watchdog
+assert_eq "$APPLY_COUNT" 1
 
 prepare_scenario telemetry
 PING_SCENARIO=up_good
@@ -229,7 +239,7 @@ esac
 test_settings_and_scoped_update
 test_metric_guards
 test_health_classifier_blocks_mtu_changes
-test_unsafe_observation_windows_are_ignored
+test_busy_servers_keep_learning
 test_watchdog_requires_repeated_evidence
 test_non_mtu_problem_is_ignored
 test_upward_candidate_requires_improvement

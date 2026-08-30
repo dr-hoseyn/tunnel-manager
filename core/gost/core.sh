@@ -222,11 +222,17 @@ gost_rebuild_config
 if [[ ! -f "${service_dir}/${GOST_SERVICE_NAME}" ]]; then
 core_gost_create_service
 fi
+if declare -F core_optimize_sync_for_tunnel >/dev/null; then
+core_optimize_sync_for_tunnel before "$GOST_SERVICE_NAME" || true
+fi
 systemctl restart "$GOST_SERVICE_NAME"
 sleep 2
 if systemctl is-active --quiet "$GOST_SERVICE_NAME"; then
 colorize green "✔ Applied and gost.service is healthy."
 gost_finish_change commit
+if declare -F core_optimize_sync_for_tunnel >/dev/null; then
+core_optimize_sync_for_tunnel after "$GOST_SERVICE_NAME" || true
+fi
 return 0
 else
 colorize red "✘ gost.service failed to come back up! Rolling back..."

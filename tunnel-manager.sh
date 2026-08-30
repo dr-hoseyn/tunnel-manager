@@ -5,7 +5,7 @@
 # pre-refactor script. Adding a new core (FRP, TUIC, ...) means writing
 # core/<name>/core.sh and wiring it in four places — see core/README.md for
 # the full plugin interface contract and a step-by-step checklist.
-SCRIPT_VERSION="v2.3.0"
+SCRIPT_VERSION="v2.4.0"
 SCRIPT_MODE="$1"
 INSTALL_DIR="/opt/tunnel-manager"
 PANEL_PATH="/usr/local/bin/backhaul"
