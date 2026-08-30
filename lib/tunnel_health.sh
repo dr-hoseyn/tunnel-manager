@@ -14,6 +14,7 @@ HEALTH_SMALL_PAYLOAD="${HEALTH_SMALL_PAYLOAD:-64}"
 HEALTH_PING_COUNT="${HEALTH_PING_COUNT:-4}"
 HEALTH_BAD_LOSS="${HEALTH_BAD_LOSS:-25}"
 HEALTH_DROP_DELTA="${HEALTH_DROP_DELTA:-10}"
+HEALTH_QDISC_DROP_DELTA="${HEALTH_QDISC_DROP_DELTA:-100}"
 HEALTH_CPU_PRESSURE="${HEALTH_CPU_PRESSURE:-85}"
 HEALTH_MEMORY_PRESSURE="${HEALTH_MEMORY_PRESSURE:-95}"
 HEALTH_CONNTRACK_PRESSURE="${HEALTH_CONNTRACK_PRESSURE:-90}"
@@ -230,6 +231,9 @@ fi
 if health_ge "$tun_drop_delta" "$HEALTH_DROP_DELTA"; then
 printf 'tunnel-interface-drops|85|tun-packet-drops-increased\n'; return
 fi
+if health_ge "$qdisc_drop_delta" "$HEALTH_QDISC_DROP_DELTA"; then
+printf 'network-congestion|90|qdisc-packet-drops-increased\n'; return
+fi
 if [[ "$outer_avg" != "NA" ]] && ! health_ge "$outer_loss" "$HEALTH_BAD_LOSS"; then
 printf 'tunnel-path-failure|85|underlay-reachable-but-inner-tunnel-unhealthy\n'; return
 fi
@@ -241,6 +245,9 @@ printf 'physical-interface-drops|80|underlay-interface-errors-or-drops\n'; retur
 fi
 if health_ge "$tun_drop_delta" "$HEALTH_DROP_DELTA"; then
 printf 'tunnel-interface-drops|80|tun-packet-drops-increased\n'; return
+fi
+if health_ge "$qdisc_drop_delta" "$HEALTH_QDISC_DROP_DELTA"; then
+printf 'network-congestion|90|qdisc-packet-drops-increased\n'; return
 fi
 if health_ge "$service_cpu" "$HEALTH_CPU_PRESSURE" && health_ge "$load_pct" 100; then
 printf 'cpu-saturation|80|service-cpu-and-system-load-high\n'; return

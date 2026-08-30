@@ -1008,7 +1008,7 @@ break
 fi
 colorize red "MTU must be between ${AUTOMTU_HARD_MIN} and ${AUTOMTU_HARD_MAX}."
 done
-prompt_boolean "Enable Smart Auto-MTU" "${CONFIG[smart_auto_mtu]:-true}" CONFIG[smart_auto_mtu]
+prompt_boolean "Enable Smart Auto-MTU" "${CONFIG[smart_auto_mtu]:-false}" CONFIG[smart_auto_mtu]
 if [[ "${CONFIG[smart_auto_mtu]}" == "true" ]]; then
 while true; do
 prompt_with_default "Smart MTU Minimum" "${CONFIG[smart_mtu_min]:-$AUTOMTU_DEFAULT_MIN}" CONFIG[smart_mtu_min]

@@ -14,6 +14,7 @@ NETTUNE_STATE_DIR="${config_dir}/.network-tune-state"
 NETTUNE_VALUES_FILE="${NETTUNE_STATE_DIR}/sysctl-values.tsv"
 NETTUNE_LAST_BACKUP_FILE="${config_dir}/.network-tune-last-backup"
 NETTUNE_LOCK_FILE="${config_dir}/.network-tune.lock"
+NETTUNE_LAST_ERROR=""
 
 core_optimize_is_applied() {
 [[ -f "$NETTUNE_SYSCTL_CONF" ]]
@@ -146,25 +147,78 @@ local current listening
 if ! current=$(nettune_baseline_value net.ipv4.ip_local_reserved_ports); then
 current=$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)
 fi
-listening=$( { ss -Htln 2>/dev/null; ss -Huln 2>/dev/null; } |
-awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | paste -sd, - )
+listening=$(nettune_managed_listener_ports | paste -sd, -)
 
 printf '%s\n%s\n' "$current" "$listening" |
 tr ',' '\n' | awk 'NF && $0 ~ /^[0-9]+(-[0-9]+)?$/ { if (!seen[$0]++) print $0 }' |
 sort -V | paste -sd, -
 }
 
+# Only reserve sockets owned by this panel's tunnel services. Reserving every
+# listener on a busy proxy can consume most of the ephemeral range and makes
+# verification unstable while unrelated applications open and close sockets.
+nettune_managed_listener_ports() {
+local unit pid pids="" pid_pattern
+command -v systemctl >/dev/null && command -v ss >/dev/null || return 0
+while IFS= read -r unit; do
+[[ "$unit" =~ ^(backhaul|gost|rathole|frp|hysteria|hysteria2|tuic)- ]] || continue
+pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)
+[[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) && pids+="${pid}"$'\n'
+done < <(systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+pids=$(printf '%s' "$pids" | sort -un | paste -sd'|' -)
+[[ -n "$pids" ]] || return 0
+pid_pattern="pid=(${pids}),"
+{ ss -Htlnp 2>/dev/null; ss -Hulnp 2>/dev/null; } |
+awk -v pid_pattern="$pid_pattern" '
+$0 ~ pid_pattern && match($4, /:[0-9]+$/) { print substr($4, RSTART + 1) }
+' | sort -un
+}
+
+nettune_normalize_ports() {
+tr ',' '\n' | awk -F- '
+/^[0-9]+$/ { if ($1 >= 1 && $1 <= 65535) ports[$1]=1; next }
+/^[0-9]+-[0-9]+$/ {
+if ($1 < 1 || $2 > 65535 || $1 > $2) next
+for (port=$1; port<=$2; port++) ports[port]=1
+}
+END {
+separator=""
+for (port=1; port<=65535; port++) if (ports[port]) {
+printf "%s%d", separator, port
+separator=","
+}
+print ""
+}
+'
+}
+
+nettune_values_match() {
+local key="$1" expected="$2" actual="$3"
+if [[ "$key" == "net.ipv4.ip_local_reserved_ports" ]]; then
+expected=$(nettune_normalize_ports <<< "$expected")
+actual=$(nettune_normalize_ports <<< "$actual")
+fi
+[[ "$actual" == "$expected" ]]
+}
+
 nettune_verify_config() {
 local conf="$1" line key expected actual
+NETTUNE_LAST_ERROR=""
 while IFS= read -r line; do
 [[ "$line" == *=* && "$line" != \#* ]] || continue
 key="${line%%=*}"
 expected="${line#*=}"
 key="${key//[[:space:]]/}"
 expected=$(awk '{$1=$1; print}' <<< "$expected")
-actual=$(sysctl -n "$key" 2>/dev/null) || return 1
+if ! actual=$(sysctl -n "$key" 2>/dev/null); then
+NETTUNE_LAST_ERROR="sysctl-unavailable:${key}"
+return 1
+fi
 actual=$(awk '{$1=$1; print}' <<< "$actual")
-[[ "$actual" == "$expected" ]] || return 1
+if ! nettune_values_match "$key" "$expected" "$actual"; then
+NETTUNE_LAST_ERROR="sysctl-mismatch:${key}"
+return 1
+fi
 done < "$conf"
 }
 
@@ -184,6 +238,7 @@ fi
 core_optimize_apply() {
 colorize cyan "--- Optimize Network (safe and reversible) ---" bold
 echo ""
+NETTUNE_LAST_ERROR=""
 
 local bbr_ok=0 conntrack_ok=0
 if ! nettune_capture_baseline; then
@@ -289,7 +344,6 @@ colorize red "Could not activate the tuning file; restoring the saved state."
 core_optimize_rollback
 return 1
 fi
-
 # Fingerprint the files as written. Rollback uses these signatures to avoid
 # clobbering later administrator changes.
 if ! nettune_record_applied_file "$NETTUNE_SYSCTL_CONF" sysctl-conf ||
@@ -300,12 +354,18 @@ core_optimize_rollback
 return 1
 fi
 
-if ! sysctl -e -p "$NETTUNE_SYSCTL_CONF" >/dev/null || ! nettune_verify_config "$NETTUNE_SYSCTL_CONF"; then
+if ! sysctl -e -p "$NETTUNE_SYSCTL_CONF" >/dev/null; then
+NETTUNE_LAST_ERROR="sysctl-apply-failed"
 colorize red "Kernel rejected one or more tuning values; restoring the saved state."
 core_optimize_rollback
 return 1
 fi
-
+if ! nettune_verify_config "$NETTUNE_SYSCTL_CONF"; then
+colorize red "Kernel rejected one or more tuning values; restoring the saved state."
+[[ -n "$NETTUNE_LAST_ERROR" ]] && colorize yellow "Verification detail: ${NETTUNE_LAST_ERROR}"
+core_optimize_rollback
+return 1
+fi
 colorize green "Network tuning applied. Original values are saved in: $NETTUNE_STATE_DIR"
 echo "RAM profile:          $((memory_kb / 1024)) MB"
 echo "Congestion control:  $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a)"
@@ -341,7 +401,7 @@ if (( result == 0 )); then
 logger -t tunnel-manager "network optimization synced (${phase}): ${subject}" 2>/dev/null || true
 return 0
 fi
-logger -t tunnel-manager "network optimization sync failed (${phase}): ${subject}" 2>/dev/null || true
+logger -t tunnel-manager "network optimization sync failed (${phase}): ${subject}; ${NETTUNE_LAST_ERROR:-unknown-error}" 2>/dev/null || true
 [[ "$phase" == "after" ]] && colorize yellow "Tunnel is active, but automatic network optimization failed; use option 11 to inspect or retry."
 return 1
 }

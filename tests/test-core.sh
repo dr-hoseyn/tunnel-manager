@@ -137,13 +137,20 @@ case "${1:-}" in
 is-enabled) [[ "$SERVICE_ENABLED" == "true" ]] ;;
 is-active) [[ "$SERVICE_ACTIVE" == "true" ]] ;;
 restart) RESTART_COUNT=$((RESTART_COUNT + 1)); SERVICE_ACTIVE="true" ;;
+list-units) printf 'backhaul-test.service loaded active running test\n' ;;
+show)
+if [[ " $* " == *" MainPID "* ]]; then printf '4242\n'; else return 0; fi
+;;
 *) return 0 ;;
 esac
 }
 logger() { :; }
 modprobe() { :; }
 LISTEN_PORT=8443
-ss() { printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:*\n' "$LISTEN_PORT"; }
+ss() {
+printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:* users:(("backhaul",pid=4242,fd=3))\n' "$LISTEN_PORT"
+printf 'LISTEN 0 128 0.0.0.0:7443 0.0.0.0:* users:(("external",pid=9999,fd=4))\n'
+}
 core_optimize_sync_for_tunnel() { OPTIMIZE_SYNC_COUNT=$((OPTIMIZE_SYNC_COUNT + 1)); }
 
 test_watchdog_respects_disable() {
@@ -193,6 +200,8 @@ assert_eq "${CONFIG[tun_mtu]}" '1320'
 assert_eq "${CONFIG[peer_ip]}" '192.0.2.44'
 assert_eq "${CONFIG[peer_ssh_port]}" '2222'
 assert_eq "${CONFIG[smart_auto_mtu]}" 'true'
+grep -qF 'prompt_boolean "Enable Smart Auto-MTU" "${CONFIG[smart_auto_mtu]:-false}" CONFIG[smart_auto_mtu]' "${ROOT_DIR}/core/backhaul/core.sh" ||
+fail "new TUN/IPX tunnels do not default Smart Auto-MTU to false"
 }
 
 test_edit_tun_conflicts_exclude_current_config() {
@@ -257,9 +266,12 @@ printf 'MemTotal:        1048576 kB\n' > "$NETTUNE_MEMINFO"
 : > "$NETTUNE_CONNTRACK_PATH"
 
 local old_rmem="${SYSVALS[net.core.rmem_max]}" old_cc="${SYSVALS[net.ipv4.tcp_congestion_control]}"
+nettune_values_match net.ipv4.ip_local_reserved_ports '1000,1001,1002,2000' '1000-1002,2000' ||
+fail "equivalent reserved-port ranges did not verify"
 core_optimize_apply >/dev/null
 [[ -f "$NETTUNE_SYSCTL_CONF" ]] || fail "optimization config was not created"
 assert_file_contains "$NETTUNE_SYSCTL_CONF" 'net.ipv4.ip_local_reserved_ports = 8443,9000'
+! grep -qF '7443' "$NETTUNE_SYSCTL_CONF" || fail "unmanaged listener was reserved"
 assert_file_contains "$NETTUNE_SYSCTL_CONF" 'net.ipv4.tcp_rmem = 4096 131072 8388608'
 assert_eq "${SYSVALS[net.ipv4.tcp_congestion_control]}" 'bbr'
 assert_eq "$(cat "$NETTUNE_LIMITS_CONF")" 'admin soft nofile 4096'

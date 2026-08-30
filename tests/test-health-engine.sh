@@ -10,6 +10,7 @@ config_dir="${TEST_ROOT}/config"
 service_dir="${TEST_ROOT}/systemd"
 HEALTH_HISTORY_LIMIT=3
 HEALTH_SAMPLE_MAX_AGE=600
+HEALTH_QDISC_DROP_DELTA=100
 mkdir -p "$config_dir" "$service_dir"
 
 # shellcheck source=../lib/common.sh
@@ -37,6 +38,7 @@ assert_eq "$(classification_of true true true 0 20 0 1 20 0 20 0 20 0 0 0 10 20 
 assert_eq "$(classification_of true true true 0 NA 100 NA NA 100 20 0 0 0 0 0 10 20 30 10 20)" tunnel-path-failure
 assert_eq "$(classification_of true true true 0 NA 100 NA NA 100 NA 100 0 0 0 0 10 20 30 10 20)" peer-or-underlay-unreachable
 assert_eq "$(classification_of true true true 0 80 0 10 80 0 20 0 0 0 0 20 10 20 30 10 20)" network-congestion
+assert_eq "$(classification_of true true true 0 20 0 1 20 0 20 0 0 0 0 100 10 20 30 10 20)" network-congestion
 assert_eq "$(classification_of true true true 0 20 0 1 NA 100 20 0 0 0 0 0 10 20 30 10 20)" mtu-suspected
 assert_eq "$(classification_of true true true 0 20 0 1 21 0 20 0 0 0 0 0 10 20 30 10 20)" healthy
 }
@@ -83,7 +85,8 @@ local drops=0
 printf '%s %s 100 100 0 0 %s 0\n' "$((300000 + SAMPLE_INDEX * 1000))" "$((400000 + SAMPLE_INDEX * 1000))" "$drops"
 fi
 }
-health_qdisc_drops() { printf '0\n'; }
+QDISC_DROPS=0
+health_qdisc_drops() { printf '%s\n' "$QDISC_DROPS"; }
 health_service_value() {
 case "$2" in
 CPUUsageNSec) printf '%s\n' "$((SAMPLE_INDEX * 1000000000))" ;;
@@ -133,8 +136,17 @@ assert_eq "$HEALTH_GATE_REASON" health-class-physical-interface-drops
 
 SAMPLE_INDEX=4
 PING_SCENARIO=healthy
+QDISC_DROPS=200
 health_collect_locked "$CONFIG_PATH" watchdog
+assert_eq "$(health_state_get "$latest" classification none)" network-congestion
+if tunnel_health_automtu_gate "$CONFIG_PATH"; then fail "qdisc congestion allowed Auto-MTU"; fi
+assert_eq "$HEALTH_GATE_REASON" health-class-network-congestion
+
 SAMPLE_INDEX=5
+QDISC_DROPS=200
+health_collect_locked "$CONFIG_PATH" watchdog
+assert_eq "$(health_state_get "$latest" classification none)" healthy
+SAMPLE_INDEX=6
 health_collect_locked "$CONFIG_PATH" watchdog
 assert_eq "$(wc -l < "$history" | tr -d ' ')" 4
 head -1 "$history" | grep -q $'^epoch\tclass\tconfidence' || fail "history header missing"

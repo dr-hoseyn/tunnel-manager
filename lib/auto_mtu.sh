@@ -18,7 +18,6 @@ AUTOMTU_CHANGE_COOLDOWN="${AUTOMTU_CHANGE_COOLDOWN:-21600}"
 AUTOMTU_REJECT_COOLDOWN="${AUTOMTU_REJECT_COOLDOWN:-86400}"
 AUTOMTU_MIN_SERVICE_UPTIME="${AUTOMTU_MIN_SERVICE_UPTIME:-600}"
 AUTOMTU_MAX_RATE_BPS="${AUTOMTU_MAX_RATE_BPS:-262144}"
-AUTOMTU_BUSY_EXTRA_STREAK="${AUTOMTU_BUSY_EXTRA_STREAK:-2}"
 AUTOMTU_TRAFFIC_SAMPLE_SECONDS="${AUTOMTU_TRAFFIC_SAMPLE_SECONDS:-1}"
 AUTOMTU_SETTLE_SECONDS="${AUTOMTU_SETTLE_SECONDS:-5}"
 AUTOMTU_SMALL_PAYLOAD="${AUTOMTU_SMALL_PAYLOAD:-64}"
@@ -263,7 +262,7 @@ automtu_run_locked() {
 local config_path="$1" mode="$2" config_name service_name state_file enabled min_mtu max_mtu step
 local current iface_mtu tun_name remote_ip now cooldown dynamic_max small_avg small_loss probe_avg probe_loss
 local good_streak bad_streak direction required candidate base_payload candidate_payload candidate_small_avg candidate_small_loss
-local candidate_avg candidate_loss backup_path traffic_busy=0
+local candidate_avg candidate_loss backup_path
 
 config_name=$(basename "${config_path%.toml}")
 service_name="backhaul-${config_name}.service"
@@ -300,8 +299,13 @@ automtu_system_load_ok || { automtu_record_skip "$state_file" "system-load-high"
 local traffic_status
 if automtu_service_is_busy "$service_name"; then traffic_status=0; else traffic_status=$?; fi
 if (( traffic_status == 0 )); then
-traffic_busy=1
 automtu_state_set "$state_file" last_traffic "high"
+if [[ "$mode" != "manual" ]]; then
+automtu_state_set "$state_file" good_streak 0
+automtu_state_set "$state_file" bad_streak 0
+automtu_record_skip "$state_file" "traffic-high"
+return 0
+fi
 elif (( traffic_status == 2 )); then
 automtu_state_set "$state_file" last_traffic "unavailable"
 automtu_record_skip "$state_file" "traffic-telemetry-unavailable"
@@ -355,11 +359,6 @@ automtu_state_set "$state_file" last_result "inconclusive-no-change"
 return 0
 fi
 [[ "$mode" == "manual" ]] && required=1
-if [[ "$mode" != "manual" && "$traffic_busy" == "1" ]]; then
-# Busy servers may never have a 256 KiB/s idle window. Continue observing and
-# require extra consecutive evidence instead of permanently disabling Auto-MTU.
-required=$((required + AUTOMTU_BUSY_EXTRA_STREAK))
-fi
 if [[ "$direction" == "up" && "$good_streak" -lt "$required" ]] || [[ "$direction" == "down" && "$bad_streak" -lt "$required" ]]; then
 automtu_state_set "$state_file" last_result "collecting-${direction}-evidence"
 return 0
